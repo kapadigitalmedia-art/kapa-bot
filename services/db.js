@@ -1,8 +1,17 @@
+const fs = require('fs');
 const path = require('path');
 const low = require('lowdb');
 const FileSync = require('lowdb/adapters/FileSync');
 
-const dbFile = path.join(__dirname, '..', 'data', 'db.json');
+// Git doesn't track empty folders, and manual GitHub uploads can easily miss
+// an empty "data" folder entirely — so create it ourselves if it's missing,
+// rather than assuming it already exists on the server.
+const dataDir = path.join(__dirname, '..', 'data');
+if (!fs.existsSync(dataDir)) {
+  fs.mkdirSync(dataDir, { recursive: true });
+}
+
+const dbFile = path.join(dataDir, 'db.json');
 const adapter = new FileSync(dbFile);
 const db = low(adapter);
 
