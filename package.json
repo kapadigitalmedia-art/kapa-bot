@@ -1,0 +1,23 @@
+{
+  "name": "kapa-bot",
+  "version": "1.0.0",
+  "description": "KAPA Technologies WhatsApp Automation Platform — attendance, lead notifications, admin dashboard, error alerts, subscription alerts, all via the official Meta WhatsApp Cloud API.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "lowdb": "^1.0.0",
+    "morgan": "^1.10.0",
+    "node-cron": "^3.0.3"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
