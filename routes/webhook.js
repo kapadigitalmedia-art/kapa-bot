@@ -4,9 +4,49 @@ const config = require('../config/config');
 const { getTenantByPhoneNumberId } = require('../config/tenants');
 const whatsapp = require('../services/whatsapp');
 const { tenantDb } = require('../services/db');
+const {
+  getConversationState: getConversationStateMysql,
+  setConversationState: setConversationStateMysql,
+  deleteConversationState: deleteConversationStateMysql,
+} = require('../services/db-mysql');
 const logger = require('../utils/logger');
 const { recordAttendance } = require('./attendance');
 const { handleAdminCommand } = require('../services/adminCommands');
+
+/**
+ * conversationState is live, mid-conversation state for a real person
+ * waiting on a bot reply — a failed lookup here means a broken
+ * conversation, not just a missing log entry. Each helper tries MySQL
+ * first and falls back to the old lowdb store on failure, same
+ * safety-net pattern as the other four migrated routes, just colocated
+ * here since there are 4 call sites below sharing 3 operations.
+ */
+async function getConvState(tenantId, phone) {
+  try {
+    return await getConversationStateMysql(tenantId, phone);
+  } catch (err) {
+    logger.warn(`[${tenantId}] MySQL read failed for conversationState, falling back to lowdb: ${err.message}`);
+    return tenantDb(tenantId).get('conversationState').get(phone).value();
+  }
+}
+
+async function setConvState(tenantId, phone, value) {
+  try {
+    await setConversationStateMysql(tenantId, phone, value);
+  } catch (err) {
+    logger.warn(`[${tenantId}] MySQL write failed for conversationState, falling back to lowdb: ${err.message}`);
+    tenantDb(tenantId).get('conversationState').set(phone, value).write();
+  }
+}
+
+async function deleteConvState(tenantId, phone) {
+  try {
+    await deleteConversationStateMysql(tenantId, phone);
+  } catch (err) {
+    logger.warn(`[${tenantId}] MySQL delete failed for conversationState, falling back to lowdb: ${err.message}`);
+    tenantDb(tenantId).get('conversationState').unset(phone).write();
+  }
+}
 
 /**
  * GET /webhook
@@ -60,16 +100,16 @@ router.post('/', async (req, res) => {
 
     // ── 1. Location messages — completes a check-in/out ──────────────────
     if (message.type === 'location') {
-      const state = tenantDb(tenant.id).get('conversationState').get(from).value();
+      const state = await getConvState(tenant.id, from);
       if (state && state.step === 'awaiting_location') {
-        const record = recordAttendance(tenant.id, {
+        const record = await recordAttendance(tenant.id, {
           phone: from,
           name: contactName,
           type: state.data.type,
           lat: message.location.latitude,
           lng: message.location.longitude,
         });
-        tenantDb(tenant.id).get('conversationState').unset(from).write();
+        await deleteConvState(tenant.id, from);
         await whatsapp.sendText(
           tenant,
           from,
@@ -86,12 +126,12 @@ router.post('/', async (req, res) => {
       const text = message.text.body.trim().toLowerCase();
 
       if (tenant.features.attendance && ['check in', 'checkin', 'check-in'].includes(text)) {
-        tenantDb(tenant.id).get('conversationState').set(from, { step: 'awaiting_location', data: { type: 'in' } }).write();
+        await setConvState(tenant.id, from, { step: 'awaiting_location', data: { type: 'in' } });
         await whatsapp.requestLocation(tenant, from, '📍 Please share your location to confirm check-in.');
         return;
       }
       if (tenant.features.attendance && ['check out', 'checkout', 'check-out'].includes(text)) {
-        tenantDb(tenant.id).get('conversationState').set(from, { step: 'awaiting_location', data: { type: 'out' } }).write();
+        await setConvState(tenant.id, from, { step: 'awaiting_location', data: { type: 'out' } });
         await whatsapp.requestLocation(tenant, from, '📍 Please share your location to confirm check-out.');
         return;
       }

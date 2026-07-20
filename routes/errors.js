@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { tenantDb } = require('../services/db');
+const { tenantDb: tenantDbMysql } = require('../services/db-mysql');
 const whatsapp = require('../services/whatsapp');
 const logger = require('../utils/logger');
 
@@ -8,6 +9,11 @@ const logger = require('../utils/logger');
  * POST /api/errors/report
  * Body: { source, message, severity }
  * severity: "low" | "medium" | "high" | "critical" (default: "medium")
+ *
+ * Writes to MySQL (bot_errors). If that write fails for any reason, falls
+ * back to the old lowdb store so the error report isn't lost — this
+ * fallback is a safety net for this first migrated route only, not a
+ * long-term dual-write strategy.
  */
 router.post('/report', async (req, res) => {
   const tenant = req.tenant;
@@ -26,10 +32,14 @@ router.post('/report', async (req, res) => {
     `Message: ${message}\n` +
     `Time: ${new Date().toLocaleString('en-MY', { timeZone: 'Asia/Kuala_Lumpur' })}`;
 
-  tenantDb(tenant.id)
-    .get('errors')
-    .push({ source, message, severity: level, timestamp: new Date().toISOString() })
-    .write();
+  const record = { source, message, severity: level, timestamp: new Date().toISOString() };
+
+  try {
+    await tenantDbMysql(tenant.id).get('errors').push(record).write();
+  } catch (err) {
+    logger.warn(`[${tenant.id}] MySQL write failed for errors, falling back to lowdb: ${err.message}`);
+    tenantDb(tenant.id).get('errors').push(record).write();
+  }
 
   const results =
     level === 'critical' || level === 'high'
@@ -44,9 +54,14 @@ router.post('/report', async (req, res) => {
 /**
  * GET /api/errors
  */
-router.get('/', (req, res) => {
-  const errors = tenantDb(req.tenant.id).get('errors').takeRight(50).reverse().value();
-  res.json({ ok: true, count: errors.length, errors });
+router.get('/', async (req, res) => {
+  try {
+    const errors = await tenantDbMysql(req.tenant.id).get('errors').takeRight(50).reverse().value();
+    res.json({ ok: true, count: errors.length, errors });
+  } catch (err) {
+    logger.warn(`[${req.tenant.id}] MySQL read failed for errors: ${err.message}`);
+    res.status(500).json({ ok: false, error: 'Failed to read errors' });
+  }
 });
 
 module.exports = router;

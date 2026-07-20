@@ -22,7 +22,11 @@ app.get('/', (req, res) => {
     ok: true,
     service: 'KAPA Bot (multi-tenant)',
     tenants: getAllTenants().map((t) => t.id),
-    mockMode: config.mockMode,
+    // Per-tenant, not a single global flag — a tenant with its own
+    // accessTokenOverride can be sending for real even while the shared
+    // default token is unset, so one boolean can't represent this
+    // accurately across multiple tenants.
+    mockMode: Object.fromEntries(getAllTenants().map((t) => [t.id, config.tenantMockMode(t)])),
     time: new Date().toISOString(),
   });
 });
@@ -43,5 +47,8 @@ app.use((req, res) => {
 app.listen(config.port, () => {
   logger.info(`KAPA Bot listening on port ${config.port}`);
   logger.info(`Registered tenants: ${getAllTenants().map((t) => t.id).join(', ') || '(none configured)'}`);
-  logger.info(`Mock mode (no default META_ACCESS_TOKEN): ${config.mockMode ? 'ON' : 'OFF'}`);
+  getAllTenants().forEach((t) => {
+    const mock = config.tenantMockMode(t);
+    logger.info(`Tenant '${t.id}': Mock mode ${mock ? 'ON (no real sends)' : 'OFF (real sending enabled)'}`);
+  });
 });

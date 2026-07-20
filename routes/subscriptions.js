@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { tenantDb } = require('../services/db');
+const { tenantDb: tenantDbMysql } = require('../services/db-mysql');
 const whatsapp = require('../services/whatsapp');
 const logger = require('../utils/logger');
 
@@ -17,6 +18,13 @@ const EVENT_LABELS = {
 /**
  * POST /api/subscriptions/alert
  * Body: { company, event, plan, amount }
+ *
+ * Writes to MySQL (bot_subscription_events — the "subscriptions" lowdb
+ * collection name is kept here as the tenantDb() key for API-shape
+ * consistency with services/db-mysql.js's COLLECTIONS map, even though the
+ * underlying table is renamed to avoid confusion with bot_companies'
+ * billing state). Falls back to lowdb on write failure, same safety-net
+ * pattern as the other three migrated routes.
  */
 router.post('/alert', async (req, res) => {
   const tenant = req.tenant;
@@ -35,10 +43,14 @@ router.post('/alert', async (req, res) => {
     (amount ? `Amount: RM ${amount}\n` : '') +
     `Time: ${new Date().toLocaleString('en-MY', { timeZone: 'Asia/Kuala_Lumpur' })}`;
 
-  tenantDb(tenant.id)
-    .get('subscriptions')
-    .push({ company, event, plan: plan || null, amount: amount || null, timestamp: new Date().toISOString() })
-    .write();
+  const record = { company, event, plan: plan || null, amount: amount || null, timestamp: new Date().toISOString() };
+
+  try {
+    await tenantDbMysql(tenant.id).get('subscriptions').push(record).write();
+  } catch (err) {
+    logger.warn(`[${tenant.id}] MySQL write failed for subscriptions, falling back to lowdb: ${err.message}`);
+    tenantDb(tenant.id).get('subscriptions').push(record).write();
+  }
 
   const result = await whatsapp.sendToOffice(tenant, text);
   logger.info(`[${tenant.id}] Subscription alert: ${company} -> ${event}`);
@@ -49,9 +61,14 @@ router.post('/alert', async (req, res) => {
 /**
  * GET /api/subscriptions
  */
-router.get('/', (req, res) => {
-  const events = tenantDb(req.tenant.id).get('subscriptions').takeRight(50).reverse().value();
-  res.json({ ok: true, count: events.length, events });
+router.get('/', async (req, res) => {
+  try {
+    const events = await tenantDbMysql(req.tenant.id).get('subscriptions').takeRight(50).reverse().value();
+    res.json({ ok: true, count: events.length, events });
+  } catch (err) {
+    logger.warn(`[${req.tenant.id}] MySQL read failed for subscriptions: ${err.message}`);
+    res.status(500).json({ ok: false, error: 'Failed to read subscription events' });
+  }
 });
 
 module.exports = router;

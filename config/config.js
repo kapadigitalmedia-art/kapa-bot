@@ -13,9 +13,20 @@ const config = {
     graphApiVersion: 'v20.0',
   },
 
-  // Mock mode kicks in automatically if no default token is set AND no
-  // tenant provides its own override — lets you build/test everything
-  // before WhatsApp is fully wired up.
+  // Whether a SPECIFIC tenant is in mock mode — mirrors the exact
+  // resolution order services/whatsapp.js uses to send
+  // (tenant.accessTokenOverride || config.meta.accessToken), so this
+  // reflects that tenant's real send capability, not just the shared
+  // default. Use this, not the global `mockMode` below, wherever the
+  // answer needs to be accurate for a given tenant.
+  tenantMockMode(tenant) {
+    return !(tenant.accessTokenOverride || this.meta.accessToken);
+  },
+
+  // Global-default-only fallback: true if the shared default token is
+  // unset. A tenant with its own accessTokenOverride can still send for
+  // real even when this is true — it does NOT account for per-tenant
+  // overrides, so don't use it to answer "can tenant X send right now?".
   get mockMode() {
     return !this.meta.accessToken;
   },
