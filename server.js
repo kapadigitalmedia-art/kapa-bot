@@ -10,6 +10,7 @@ const leadsRoutes = require('./routes/leads');
 const { router: attendanceRoutes } = require('./routes/attendance');
 const errorsRoutes = require('./routes/errors');
 const subscriptionsRoutes = require('./routes/subscriptions');
+const productsRoutes = require('./routes/products');
 
 const app = express();
 
@@ -39,6 +40,11 @@ app.use('/api/leads', requireTenant, leadsRoutes);
 app.use('/api/attendance', requireTenant, attendanceRoutes);
 app.use('/api/errors', requireTenant, errorsRoutes);
 app.use('/api/subscriptions', requireTenant, subscriptionsRoutes);
+
+// ── Product pricing — GET is public (website reads it), PUT is
+//    admin-only (requireAdmin applied inside routes/products.js itself,
+//    since this router mixes public and admin-protected routes) ────────
+app.use('/api/products', productsRoutes);
 
 app.use((req, res) => {
   res.status(404).json({ ok: false, error: 'Not found' });
