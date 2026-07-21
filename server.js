@@ -45,6 +45,7 @@ app.use('/api/subscriptions', requireTenant, subscriptionsRoutes);
 //    admin-only (requireAdmin applied inside routes/products.js itself,
 //    since this router mixes public and admin-protected routes) ────────
 app.use('/api/products', productsRoutes);
+app.use('/api/exchange-rates', productsRoutes.exchangeRatesRouter);
 
 app.use((req, res) => {
   res.status(404).json({ ok: false, error: 'Not found' });

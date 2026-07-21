@@ -5,6 +5,9 @@ const { requireAdmin } = require('../middleware/adminAuth');
 const logger = require('../utils/logger');
 
 const TIER_FIELDS = ['tier_name', 'tier_order', 'setup_fee', 'monthly_price', 'is_active'];
+const RATE_FIELDS = ['rate_to_myr', 'symbol'];
+
+const exchangeRatesRouter = express.Router();
 
 /**
  * Fetches active products with their active tiers nested as
@@ -54,6 +57,34 @@ async function fetchProductsWithTiers(slug) {
 }
 
 /**
+ * Looks up a single currency's rate_to_myr/symbol. Returns null (never
+ * throws) for an unknown code, so callers can silently skip conversion
+ * and fall back to MYR-only output instead of erroring the whole request.
+ */
+async function getExchangeRate(code) {
+  const [rows] = await pool.query(
+    'SELECT currency_code, rate_to_myr, symbol FROM bot_exchange_rates WHERE currency_code = ?',
+    [String(code).toUpperCase()]
+  );
+  return rows[0] || null;
+}
+
+/**
+ * Mutates each tier in-place, adding converted_setup_fee/
+ * converted_monthly_price/currency_symbol alongside the original MYR
+ * fields (which are left untouched).
+ */
+function applyCurrencyConversion(products, rate) {
+  for (const product of products) {
+    for (const tier of product.tiers) {
+      tier.converted_setup_fee = Number((tier.setup_fee * rate.rate_to_myr).toFixed(2));
+      tier.converted_monthly_price = Number((tier.monthly_price * rate.rate_to_myr).toFixed(2));
+      tier.currency_symbol = rate.symbol;
+    }
+  }
+}
+
+/**
  * GET /api/products
  * Public — the website calls this directly to render pricing, no auth.
  * Each product includes its active tiers nested as tiers: [...].
@@ -61,6 +92,10 @@ async function fetchProductsWithTiers(slug) {
 router.get('/', async (req, res) => {
   try {
     const products = await fetchProductsWithTiers();
+    if (req.query.currency) {
+      const rate = await getExchangeRate(req.query.currency);
+      if (rate) applyCurrencyConversion(products, rate);
+    }
     res.json({ ok: true, count: products.length, products });
   } catch (err) {
     logger.error('Failed to list products:', err);
@@ -77,6 +112,10 @@ router.get('/:slug', async (req, res) => {
     const products = await fetchProductsWithTiers(req.params.slug);
     if (!products.length) {
       return res.status(404).json({ ok: false, error: 'Product not found' });
+    }
+    if (req.query.currency) {
+      const rate = await getExchangeRate(req.query.currency);
+      if (rate) applyCurrencyConversion(products, rate);
     }
     res.json({ ok: true, product: products[0] });
   } catch (err) {
@@ -177,4 +216,54 @@ router.post('/:slug/tiers', requireAdmin, async (req, res) => {
   }
 });
 
+/**
+ * GET /api/exchange-rates
+ * Public — returns all stored currency rates.
+ */
+exchangeRatesRouter.get('/', async (req, res) => {
+  try {
+    const [rates] = await pool.query('SELECT currency_code, rate_to_myr, symbol, updated_at FROM bot_exchange_rates');
+    res.json({ ok: true, count: rates.length, rates });
+  } catch (err) {
+    logger.error('Failed to list exchange rates:', err);
+    res.status(500).json({ ok: false, error: 'Failed to load exchange rates' });
+  }
+});
+
+/**
+ * PUT /api/exchange-rates/:code
+ * Admin-only — updates rate_to_myr and/or symbol for a currency.
+ */
+exchangeRatesRouter.put('/:code', requireAdmin, async (req, res) => {
+  const updates = {};
+  for (const field of RATE_FIELDS) {
+    if (req.body[field] !== undefined) updates[field] = req.body[field];
+  }
+
+  if (Object.keys(updates).length === 0) {
+    return res.status(400).json({ ok: false, error: `No updatable fields provided. Allowed: ${RATE_FIELDS.join(', ')}` });
+  }
+
+  const code = req.params.code.toUpperCase();
+  const setClause = Object.keys(updates).map((f) => `${f} = ?`).join(', ');
+  const values = [...Object.values(updates), code];
+
+  try {
+    const [result] = await pool.execute(
+      `UPDATE bot_exchange_rates SET ${setClause} WHERE currency_code = ?`,
+      values
+    );
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ ok: false, error: 'Currency not found' });
+    }
+    const [rows] = await pool.query('SELECT * FROM bot_exchange_rates WHERE currency_code = ?', [code]);
+    logger.info(`Exchange rate updated: ${code} -> ${JSON.stringify(updates)}`);
+    res.json({ ok: true, rate: rows[0] });
+  } catch (err) {
+    logger.error(`Failed to update exchange rate ${code}:`, err);
+    res.status(500).json({ ok: false, error: 'Failed to update exchange rate' });
+  }
+});
+
 module.exports = router;
+module.exports.exchangeRatesRouter = exchangeRatesRouter;
