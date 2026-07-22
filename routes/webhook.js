@@ -117,6 +117,14 @@ router.post('/', async (req, res) => {
       return;
     }
 
+    if (!resolvedTenant && reason === 'access_blocked') {
+      // Asia Avid's real employee numbers, explicitly refused now that
+      // this phone_number_id is the shared demo number — must NOT fall
+      // through to the picker/any other flow, unlike not_signed_up.
+      await whatsapp.sendText(configTenant, from, 'This number no longer has access to this system. Please contact KAPA Technologies if you have questions.');
+      return;
+    }
+
     if (!resolvedTenant && reason === 'trial_expired') {
       await whatsapp.sendText(configTenant, from, "⏰ Your trial has ended. Contact us to continue using KAPA ONE!\n\n👉 wa.me/917305737508");
       return;

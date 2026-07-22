@@ -38,6 +38,33 @@
 const { getTenantByPhoneNumberId, SHARED_DEMO_PHONE_NUMBER_ID } = require('../config/tenants');
 const { getEmployeeByPhone, getTrialSignupByPhone } = require('./db-mysql');
 
+// Asia Avid's 12 real employee numbers (pulled from the actual seeded
+// bot_employees rows under tenant_id='kapa'), blocked explicitly now
+// that KAPA_PHONE_NUMBER_ID has been repointed to the shared demo
+// number (.env change) — this number is now for prospect/demo use only.
+// Real Asia Avid business shouldn't run through what's now a
+// public-facing demo line, so these specific numbers are refused
+// outright rather than silently still granted real employee access via
+// a stale bot_employees match under 'kapa'.
+const BLOCKED_NUMBERS = [
+  '60132075856',  // Turai Raja @ Durai Raj Pulakrishnan
+  '60122879403',  // Devandran Kamela Kumaran
+  '60164944240',  // Hafizh Mateen Bin Azizan
+  '601128618935', // Ahmad Faisal Bin Mohd Taha
+  '60166299272',  // Lob Mahadir
+  '60108090831',  // Sharifah
+  '601165098787', // Sivaranjani
+  '60162359365',  // Selvan
+  '601133379567', // Thinesshvaran
+  '601166190711', // Thaneshwaran
+  '601163982116', // Kumar
+  '601121250577', // Tinaakaran
+];
+
+function cleanNumber(n) {
+  return String(n || '').replace(/[\s+-]/g, '');
+}
+
 /**
  * Returns { tenant, reason?, trialInfo?, configTenant }. tenant is null
  * whenever there's no resolved business tenant to scope data to —
@@ -46,6 +73,17 @@ const { getEmployeeByPhone, getTrialSignupByPhone } = require('./db-mysql');
  */
 async function resolveTenantForMessage(phoneNumberId, senderWhatsappNumber) {
   const configTenant = getTenantByPhoneNumberId(phoneNumberId);
+
+  // Checked before any employee/trial-signup lookup (the actual
+  // per-message business resolution below) — configTenant is still
+  // resolved first (a cheap, synchronous, DB-free call), since even this
+  // reply needs valid WhatsApp-sending credentials, same requirement
+  // every other null-tenant reason (not_signed_up/trial_expired) already
+  // has.
+  if (BLOCKED_NUMBERS.includes(cleanNumber(senderWhatsappNumber))) {
+    return { tenant: null, reason: 'access_blocked', configTenant };
+  }
+
   if (!configTenant) return { tenant: null, reason: 'unknown_phone_number_id', configTenant: null };
 
   if (configTenant.id === 'kapa' && phoneNumberId === SHARED_DEMO_PHONE_NUMBER_ID) {
