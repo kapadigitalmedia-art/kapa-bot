@@ -15,6 +15,29 @@ const trialSignupRoutes = require('./routes/trialSignup');
 
 const app = express();
 
+// CORS — no cors package for two header lines. Restricted to the kapa
+// website's one real origin (every page ships under www.kapa.my per
+// deploy-to-hostinger.sh's paths) rather than '*': CORS is a
+// browser-enforced policy only (curl/Postman/server-to-server calls were
+// never affected), and doesn't weaken the x-api-key/requireTenant/
+// requireAdmin auth already protecting the non-public routes — but
+// least-privilege is still the safer default when it costs nothing.
+// Found missing entirely (app-wide, not route-specific) while verifying
+// the live trial-signup wiring: the OPTIONS preflight was returning a
+// bare 200 with no Access-Control-* headers at all, which silently
+// blocks the actual POST in every real browser — curl-based smoke
+// testing never caught it, since curl doesn't enforce CORS.
+const ALLOWED_ORIGIN = 'https://www.kapa.my';
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
+  res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 app.use(express.json());
 app.use(morgan('tiny'));
 
