@@ -9,6 +9,8 @@ const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcrypt');
 const { createTrialSignup, getTrialSignupByPhone } = require('../services/db-mysql');
+const { getIndustryById } = require('../services/prospectDemo');
+const { sendWelcomeEmail } = require('../services/email');
 const logger = require('../utils/logger');
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -95,6 +97,20 @@ router.post('/', async (req, res) => {
     }
 
     logger.info(`New trial signup: ${companyName} (${cleanNumber}) — industry=${industrySlug}, tenant_id=${result.tenant_id}`);
+
+    // sendWelcomeEmail never throws (see its own header comment) — awaited
+    // here only so the log line below reflects the real outcome, not to
+    // gate the response on it. Fires for both hasWorkingDemo outcomes,
+    // same as the rest of this success path.
+    const emailResult = await sendWelcomeEmail(String(email).trim(), {
+      contactName: String(name).trim(),
+      companyName: String(companyName).trim(),
+      industryName: getIndustryById(industrySlug)?.name || industrySlug,
+      trialEndsAt,
+    });
+    if (!emailResult.ok) {
+      logger.warn(`Welcome email did not send for ${cleanNumber} (${companyName}): ${JSON.stringify(emailResult)}`);
+    }
 
     return res.json({
       success: true,

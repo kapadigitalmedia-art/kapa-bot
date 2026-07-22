@@ -18,7 +18,8 @@
     "lowdb": "^1.0.0",
     "morgan": "^1.10.0",
     "mysql2": "^3.23.1",
-    "node-cron": "^3.0.3"
+    "node-cron": "^3.0.3",
+    "resend": "^6.18.0"
   },
   "license": "UNLICENSED",
   "private": true
