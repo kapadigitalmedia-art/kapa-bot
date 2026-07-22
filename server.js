@@ -17,23 +17,36 @@ const adminSignupsRoutes = require('./routes/adminSignups');
 
 const app = express();
 
-// CORS — no cors package for two header lines. Restricted to the kapa
-// website's one real origin (every page ships under www.kapa.my per
-// deploy-to-hostinger.sh's paths) rather than '*': CORS is a
-// browser-enforced policy only (curl/Postman/server-to-server calls were
-// never affected), and doesn't weaken the x-api-key/requireTenant/
-// requireAdmin auth already protecting the non-public routes — but
-// least-privilege is still the safer default when it costs nothing.
+// CORS — no cors package for a few header lines. Restricted to kapa's
+// known real origins (the marketing site + the admin dashboard) rather
+// than '*': CORS is a browser-enforced policy only (curl/Postman/
+// server-to-server calls were never affected), and doesn't weaken the
+// x-api-key/requireTenant/requireAdmin auth already protecting the
+// non-public routes — but least-privilege is still the safer default
+// when it costs nothing.
 // Found missing entirely (app-wide, not route-specific) while verifying
 // the live trial-signup wiring: the OPTIONS preflight was returning a
 // bare 200 with no Access-Control-* headers at all, which silently
 // blocks the actual POST in every real browser — curl-based smoke
 // testing never caught it, since curl doesn't enforce CORS.
-const ALLOWED_ORIGIN = 'https://www.kapa.my';
+// Access-Control-Allow-Origin can only ever echo back ONE origin per
+// response, not a list — so with multiple allowed origins, the actual
+// request's Origin header has to be checked against the allowlist and
+// reflected back only on a match, rather than always sending one static
+// value. x-admin-key is included in Allow-Headers alongside x-api-key:
+// found needed via a real Puppeteer test against the admin dashboard's
+// Trial Signups tab, whose preflight sends
+// Access-Control-Request-Headers: x-admin-key — omitting it here would
+// have left the origin-array fix still incomplete for that specific
+// caller.
+const ALLOWED_ORIGINS = ['https://www.kapa.my', 'https://admin.kapa.my'];
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
+  const origin = req.headers.origin;
+  if (ALLOWED_ORIGINS.includes(origin)) {
+    res.header('Access-Control-Allow-Origin', origin);
+  }
   res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, x-api-key, x-admin-key');
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
   }
