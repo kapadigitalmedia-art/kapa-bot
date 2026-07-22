@@ -7,18 +7,20 @@
 
 const express = require('express');
 const router = express.Router();
+const bcrypt = require('bcrypt');
 const { createTrialSignup, getTrialSignupByPhone } = require('../services/db-mysql');
 const logger = require('../utils/logger');
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const TRIAL_LENGTH_MS = 7 * 24 * 60 * 60 * 1000;
+const BCRYPT_ROUNDS = 10;
 
 function cleanWhatsappNumber(n) {
   return String(n || '').trim().replace(/[\s+-]/g, '');
 }
 
 router.post('/', async (req, res) => {
-  const { name, email, whatsappNumber, companyName, industrySlug, countryCode } = req.body || {};
+  const { name, email, whatsappNumber, companyName, industrySlug, countryCode, password } = req.body || {};
 
   const cleanNumber = cleanWhatsappNumber(whatsappNumber);
 
@@ -36,6 +38,9 @@ router.post('/', async (req, res) => {
   }
   if (!industrySlug || !String(industrySlug).trim()) {
     return res.status(400).json({ success: false, error: 'Please select an industry.' });
+  }
+  if (!password || String(password).length < 8) {
+    return res.status(400).json({ success: false, error: 'Password must be at least 8 characters.' });
   }
 
   // Not one of the 9 real product slugs (e.g. 'kapa_ai', 'not_sure') is
@@ -68,6 +73,8 @@ router.post('/', async (req, res) => {
   const trialEndsAt = new Date(Date.now() + TRIAL_LENGTH_MS);
 
   try {
+    const passwordHash = await bcrypt.hash(String(password), BCRYPT_ROUNDS);
+
     const result = await createTrialSignup({
       whatsapp_number: cleanNumber,
       industry_slug: industrySlug,
@@ -76,6 +83,7 @@ router.post('/', async (req, res) => {
       email: String(email).trim(),
       country_code: countryCode || 'MY',
       trial_ends_at: trialEndsAt,
+      password_hash: passwordHash,
     });
 
     if (!result) {

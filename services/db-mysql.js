@@ -1135,10 +1135,15 @@ async function createTrialSignup(data) {
   // own tenant immediately — able to check in/apply leave/etc. without
   // any separate onboarding step. full_name is NOT NULL on bot_employees,
   // so it falls back to company_name/tenantId the same way tenant_name
-  // did above if contact_name wasn't given.
+  // did above if contact_name wasn't given. password_hash (migration
+  // 024) is nullable — callers that don't need dashboard/Hub login for
+  // this employee can omit data.password_hash entirely and get NULL,
+  // same as every pre-existing employee row that was never given one.
+  // Hashing itself (bcrypt, one-way) happens at the caller, not here —
+  // this function only ever stores whatever hash it's given.
   const [employeeResult] = await pool.execute(
-    'INSERT INTO bot_employees (tenant_id, full_name, whatsapp_number, role, is_active) VALUES (?, ?, ?, ?, ?)',
-    [tenantId, data.contact_name || data.company_name || tenantId, cleanNumber, 'owner', true]
+    'INSERT INTO bot_employees (tenant_id, full_name, whatsapp_number, role, is_active, password_hash) VALUES (?, ?, ?, ?, ?, ?)',
+    [tenantId, data.contact_name || data.company_name || tenantId, cleanNumber, 'owner', true, data.password_hash ?? null]
   );
   const employeeId = employeeResult.insertId;
 
