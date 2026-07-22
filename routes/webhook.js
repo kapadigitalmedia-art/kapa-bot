@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const config = require('../config/config');
-const { getTenantByPhoneNumberId } = require('../config/tenants');
+const { resolveTenantForMessage } = require('../services/tenantResolution');
 const whatsapp = require('../services/whatsapp');
 const { tenantDb } = require('../services/db');
 const {
@@ -29,6 +29,21 @@ const { sendIndustryPicker, handleIndustrySelection, simulateDemoCheckIn, simula
  * first and falls back to the old lowdb store on failure, same
  * safety-net pattern as the other four migrated routes, just colocated
  * here since there are 4 call sites below sharing 3 operations.
+ *
+ * TODO/FIXME — known asymmetry bug, confirmed via a real end-to-end test
+ * (trial signup whose tenant_id had no matching bot_companies row):
+ * setConvState falls back to lowdb only when its MySQL INSERT/UPDATE
+ * throws. getConvState's MySQL SELECT for that same tenant_id succeeds
+ * trivially (finds zero rows, no exception) — so it never falls back to
+ * lowdb, and silently returns undefined instead of the state that
+ * actually got written there. Net effect: once a single write for a
+ * given tenant_id/phone falls back to lowdb, every subsequent read via
+ * this MySQL-first path sees nothing, breaking multi-step conversations
+ * (e.g. check-in text -> location share) for that tenant, with no error
+ * surfaced anywhere. Needs a real fix in its own turn — e.g. getConvState
+ * merging/preferring lowdb whenever a lowdb entry exists at all, not only
+ * when its own MySQL call throws — not bundled with today's trial-signup
+ * work.
  */
 async function getConvState(tenantId, phone) {
   try {
@@ -94,14 +109,31 @@ router.post('/', async (req, res) => {
     if (!message) return; // status update / non-message event — ignore
 
     const incomingPhoneNumberId = value?.metadata?.phone_number_id;
-    const tenant = getTenantByPhoneNumberId(incomingPhoneNumberId);
+    const from = message.from;
+    const { tenant: resolvedTenant, reason, configTenant } = await resolveTenantForMessage(incomingPhoneNumberId, from);
 
-    if (!tenant) {
+    if (!resolvedTenant && reason === 'unknown_phone_number_id') {
       logger.warn(`Incoming message for UNKNOWN phone_number_id=${incomingPhoneNumberId} — no matching tenant in config/tenants.js. Ignoring.`);
       return;
     }
 
-    const from = message.from;
+    if (!resolvedTenant && reason === 'trial_expired') {
+      await whatsapp.sendText(configTenant, from, "⏰ Your trial has ended. Contact us to continue using KAPA ONE!\n\n👉 wa.me/917305737508");
+      return;
+    }
+
+    // Either a genuinely resolved tenant (a real kapa/Asia-Avid employee,
+    // or an active trial customer's own isolated tenant), or
+    // reason === 'not_signed_up' (a prospect with no trial yet) — the
+    // latter falls through to configTenant rather than short-circuiting
+    // here, so the existing employee-vs-prospect fork below
+    // (getEmployeeByPhone) keeps working completely unchanged: a genuine
+    // prospect has no bot_employees row under 'kapa' either way, so they
+    // transparently land in the same demo/industry-picker flow as
+    // before this wiring. See tenantResolution.js's header comment for
+    // why not_signed_up specifically must NOT short-circuit here.
+    const tenant = resolvedTenant || configTenant;
+
     const contactName = value?.contacts?.[0]?.profile?.name || null;
     const isAdmin = (tenant.adminNumbers || []).includes(from);
 

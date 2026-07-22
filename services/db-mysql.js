@@ -1078,15 +1078,18 @@ async function getTrialSignupByPhone(whatsappNumber) {
 
 /**
  * Creates a trial signup's bot_tenants row FIRST, then its
- * bot_trial_signups row referencing it — two inserts, not wrapped in a
+ * bot_trial_signups row referencing it, then a bot_employees row for the
+ * signer themselves (role='owner') so they can immediately check in/
+ * apply leave/etc. in their own tenant — three inserts, not wrapped in a
  * real transaction (no transaction wrapper exists anywhere else in this
  * codebase either, e.g. createTask's task+assignments inserts have the
- * exact same gap). KNOWN GAP: if the second insert fails after the first
- * succeeds, the bot_tenants row is left orphaned (no bot_trial_signups
- * row references it) — inert, not actively harmful (nothing resolves to
- * an orphaned tenant_id without a matching signup row), but would need
- * manual cleanup if it ever happens. Not over-engineering a rollback for
- * one function when the rest of the codebase doesn't have one either.
+ * exact same gap). KNOWN GAP: if a later insert fails after an earlier
+ * one succeeds, the earlier row(s) are left committed with nothing
+ * referencing them yet — inert, not actively harmful (nothing resolves
+ * to an orphaned tenant_id/signup without its dependent row), but would
+ * need manual cleanup/retry if it ever happens. Not over-engineering a
+ * rollback for one function when the rest of the codebase doesn't have
+ * one either.
  */
 async function createTrialSignup(data) {
   const tenantId = `trial_${crypto.randomUUID()}`;
@@ -1128,7 +1131,29 @@ async function createTrialSignup(data) {
     return null;
   }
 
-  return { id: signupId, tenant_id: tenantId };
+  // Makes the trial signer themselves a real, usable employee in their
+  // own tenant immediately — able to check in/apply leave/etc. without
+  // any separate onboarding step. full_name is NOT NULL on bot_employees,
+  // so it falls back to company_name/tenantId the same way tenant_name
+  // did above if contact_name wasn't given.
+  const [employeeResult] = await pool.execute(
+    'INSERT INTO bot_employees (tenant_id, full_name, whatsapp_number, role, is_active) VALUES (?, ?, ?, ?, ?)',
+    [tenantId, data.contact_name || data.company_name || tenantId, cleanNumber, 'owner', true]
+  );
+  const employeeId = employeeResult.insertId;
+
+  // Same defensive check as the two inserts above. KNOWN GAP (same
+  // class as before, still not solved here): a failure on this third
+  // insert leaves the bot_tenants row AND the bot_trial_signups row
+  // already committed, with no matching bot_employees row — the signup
+  // "succeeded" but the signer can't actually use the bot yet. No real
+  // transaction wrapper exists anywhere in this codebase to roll all
+  // three back together.
+  if (employeeId === null || employeeId === undefined) {
+    return null;
+  }
+
+  return { id: signupId, tenant_id: tenantId, employee_id: employeeId };
 }
 
 module.exports = {

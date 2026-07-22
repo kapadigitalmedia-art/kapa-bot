@@ -13,29 +13,40 @@
 // is deliberately DB-free, pure static/env-var config, consistent with
 // every other config/*.js file in this repo.
 //
-// NOT YET WIRED into routes/webhook.js. The existing call site there
-// (the getTenantByPhoneNumberId(incomingPhoneNumberId) call around line
-// 95) still does per-NUMBER-only resolution today — this function is
-// built and verified here in isolation first. Wiring it in is the next
-// step, and it needs to be reconciled with the prospect/industry-picker
-// fork already living in webhook.js's text handler (the getEmployeeByPhone
-// check at the top of that handler): once this function's own
-// employee-check-first logic is the thing deciding `tenant`, that
-// handler's fork and this function's 'not_signed_up' reason describe
-// the same real-vs-prospect distinction in two places, and it's not yet
-// decided which one should own it going forward.
+// Wired into routes/webhook.js's top-level resolution call site.
+// configTenant is returned alongside tenant in every branch — even when
+// tenant is null (not_signed_up/trial_expired), the caller still needs
+// valid WhatsApp-sending credentials to reply (kapa's shared demo
+// number's own config), which only configTenant carries; tenant itself
+// is deliberately null in those cases since there's no real *business*
+// tenant to scope data to yet.
+//
+// Reconciliation with webhook.js's existing prospect/industry-picker
+// fork (the getEmployeeByPhone check at the top of the text handler):
+// not_signed_up does NOT short-circuit at the webhook.js call site —
+// the caller falls through to `tenant = resolvedTenant || configTenant`
+// and lets that existing fork run unchanged. Short-circuiting immediately
+// (e.g. always calling sendIndustryPicker for not_signed_up) would
+// resend the picker even to a prospect mid-demo_exploring, and would
+// make the list_reply handler unreachable for genuine prospects (they're
+// always not_signed_up, so they'd never get past an early return to
+// reach it). Falling through works because a genuine prospect has no
+// bot_employees row under 'kapa' either way, so the existing fork
+// naturally lands them in the same demo/picker flow with no special
+// casing needed here.
 
 const { getTenantByPhoneNumberId, SHARED_DEMO_PHONE_NUMBER_ID } = require('../config/tenants');
 const { getEmployeeByPhone, getTrialSignupByPhone } = require('./db-mysql');
 
 /**
- * Returns { tenant, reason?, trialInfo? }. tenant is null whenever the
- * message shouldn't be processed further — callers should check for
- * that and use `reason` to decide what (if anything) to reply with.
+ * Returns { tenant, reason?, trialInfo?, configTenant }. tenant is null
+ * whenever there's no resolved business tenant to scope data to —
+ * callers should check for that and use `reason` (plus configTenant, for
+ * sending) to decide what to reply with.
  */
 async function resolveTenantForMessage(phoneNumberId, senderWhatsappNumber) {
   const configTenant = getTenantByPhoneNumberId(phoneNumberId);
-  if (!configTenant) return { tenant: null, reason: 'unknown_phone_number_id' };
+  if (!configTenant) return { tenant: null, reason: 'unknown_phone_number_id', configTenant: null };
 
   if (configTenant.id === 'kapa' && phoneNumberId === SHARED_DEMO_PHONE_NUMBER_ID) {
     // Real kapa/Asia-Avid employees share this exact number with every
@@ -48,21 +59,21 @@ async function resolveTenantForMessage(phoneNumberId, senderWhatsappNumber) {
     // earlier, since resolution runs before that handler does.
     const employee = await getEmployeeByPhone('kapa', senderWhatsappNumber);
     if (employee) {
-      return { tenant: configTenant };
+      return { tenant: configTenant, configTenant };
     }
 
     const trialSignup = await getTrialSignupByPhone(senderWhatsappNumber);
-    if (!trialSignup) return { tenant: null, reason: 'not_signed_up' };
-    if (trialSignup.status === 'expired') return { tenant: null, reason: 'trial_expired' };
+    if (!trialSignup) return { tenant: null, reason: 'not_signed_up', configTenant };
+    if (trialSignup.status === 'expired') return { tenant: null, reason: 'trial_expired', configTenant };
 
     // Merge: WhatsApp-sending config stays kapa's (shared number/token);
     // .id is overridden to the trial's OWN tenant_id so every downstream
     // db-mysql.js call scopes to their isolated data, not kapa's.
     const realTenant = { ...configTenant, id: trialSignup.tenant_id, name: trialSignup.company_name };
-    return { tenant: realTenant, trialInfo: trialSignup };
+    return { tenant: realTenant, trialInfo: trialSignup, configTenant };
   }
 
-  return { tenant: configTenant };
+  return { tenant: configTenant, configTenant };
 }
 
 module.exports = { resolveTenantForMessage };
