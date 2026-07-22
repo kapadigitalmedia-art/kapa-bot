@@ -11,6 +11,7 @@ const { router: attendanceRoutes } = require('./routes/attendance');
 const errorsRoutes = require('./routes/errors');
 const subscriptionsRoutes = require('./routes/subscriptions');
 const productsRoutes = require('./routes/products');
+const trialSignupRoutes = require('./routes/trialSignup');
 
 const app = express();
 
@@ -46,6 +47,10 @@ app.use('/api/subscriptions', requireTenant, subscriptionsRoutes);
 //    since this router mixes public and admin-protected routes) ────────
 app.use('/api/products', productsRoutes);
 app.use('/api/exchange-rates', productsRoutes.exchangeRatesRouter);
+
+// ── Trial signup — public, no api-key/tenant yet (that's the whole
+//    point: this is what CREATES a tenant) ──────────────────────────────
+app.use('/api/trial-signup', trialSignupRoutes);
 
 app.use((req, res) => {
   res.status(404).json({ ok: false, error: 'Not found' });
