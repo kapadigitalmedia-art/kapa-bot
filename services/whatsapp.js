@@ -135,4 +135,52 @@ async function sendButtons(tenant, to, bodyText, buttons) {
   }
 }
 
-module.exports = { sendText, sendToOffice, sendToAllAdmins, requestLocation, sendButtons };
+/**
+ * Send an interactive LIST message — used where more than 3 options are
+ * needed (sendButtons' underlying 'button' type caps at 3; 'list' caps
+ * at 10 rows across sections). sections is passed straight through as
+ * Meta's own shape (array of { title, rows: [{id, title, description}] }
+ * objects) rather than a flatter invented one, since a caller with rows
+ * that need grouping can pass multiple sections without this function
+ * changing at all — today's only caller (the industry picker) just uses
+ * one.
+ */
+async function sendList(tenant, to, bodyText, buttonText, sections) {
+  if (!tenant) return { ok: false, error: 'Unknown tenant' };
+  if (!to) return { ok: false, error: 'Missing destination number' };
+
+  const accessToken = tenant.accessTokenOverride || config.meta.accessToken;
+  const phoneNumberId = tenant.phoneNumberId;
+
+  if (!accessToken || !phoneNumberId) {
+    logger.info(`[MOCK MODE] [${tenant.id}] Would send list to ${to}: ${bodyText} | sections=${JSON.stringify(sections)}`);
+    return { ok: true, mock: true };
+  }
+
+  const url = `https://graph.facebook.com/${config.meta.graphApiVersion}/${phoneNumberId}/messages`;
+
+  try {
+    const res = await axios.post(
+      url,
+      {
+        messaging_product: 'whatsapp',
+        to,
+        type: 'interactive',
+        interactive: {
+          type: 'list',
+          body: { text: bodyText },
+          action: { button: buttonText, sections },
+        },
+      },
+      { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' }, timeout: 15000 }
+    );
+    logger.info(`[${tenant.id}] WhatsApp list sent -> ${to} | messageId=${res.data?.messages?.[0]?.id || 'n/a'}`);
+    return { ok: true, data: res.data };
+  } catch (err) {
+    const detail = err.response?.data || err.message;
+    logger.error(`[${tenant.id}] WhatsApp list send FAILED -> ${to}`, detail);
+    return { ok: false, error: JSON.stringify(detail) };
+  }
+}
+
+module.exports = { sendText, sendToOffice, sendToAllAdmins, requestLocation, sendButtons, sendList };

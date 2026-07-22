@@ -20,6 +20,7 @@ const { handleExpenseApprovalReply } = require('../services/expenseApproval');
 const { handleTaskCompletionApprovalReply } = require('../services/taskCompletion');
 const { broadcastNotifyOnly } = require('../services/approvalEngine');
 const { getLateReasonSummary } = require('../services/lateReason');
+const { sendIndustryPicker, handleIndustrySelection, simulateDemoCheckIn, simulateDemoCheckOut } = require('../services/prospectDemo');
 
 /**
  * conversationState is live, mid-conversation state for a real person
@@ -178,71 +179,101 @@ router.post('/', async (req, res) => {
     // ── 2. Plain text messages ────────────────────────────────────────────
     if (message.type === 'text') {
       const text = message.text.body.trim().toLowerCase();
+      // Looked up once here and reused below — the check-in/checkout
+      // branches used to each re-fetch this independently. It also now
+      // decides which of two entirely separate branches runs: a known
+      // employee gets the existing attendance/admin/greeting logic
+      // unchanged; anyone else gets the prospect/demo flow below, which
+      // never touches bot_employees or any real attendance table.
+      const employee = await getEmployeeByPhone(tenant.id, from);
 
-      const lateReasonState = await getConvState(tenant.id, from);
-      if (lateReasonState && lateReasonState.step === 'awaiting_late_reason') {
-        const employee = await getEmployeeByPhone(tenant.id, from);
-        if (!employee) {
+      if (employee) {
+        const lateReasonState = await getConvState(tenant.id, from);
+        if (lateReasonState && lateReasonState.step === 'awaiting_late_reason') {
+          const reason = message.text.body.trim();
           await deleteConvState(tenant.id, from);
-          await whatsapp.sendText(tenant, from, "We couldn't find your employee record. Please contact your admin.");
+          const sendInfoFn = (contact, msgText) => whatsapp.sendText(tenant, contact, msgText);
+          await broadcastNotifyOnly(
+            tenant.id,
+            'late_reason',
+            employee,
+            employee.role,
+            sendInfoFn,
+            () => getLateReasonSummary(tenant.id, 'late_reason', {
+              employeeName: employee.full_name,
+              checkinTime: lateReasonState.data.checkinTime,
+              lateMinutes: lateReasonState.data.lateMinutes,
+              reason,
+            })
+          );
+          await whatsapp.sendText(tenant, from, '✅ Reason recorded. Thank you for reporting.');
           return;
         }
-        const reason = message.text.body.trim();
-        await deleteConvState(tenant.id, from);
-        const sendInfoFn = (contact, msgText) => whatsapp.sendText(tenant, contact, msgText);
-        await broadcastNotifyOnly(
-          tenant.id,
-          'late_reason',
-          employee,
-          employee.role,
-          sendInfoFn,
-          () => getLateReasonSummary(tenant.id, 'late_reason', {
-            employeeName: employee.full_name,
-            checkinTime: lateReasonState.data.checkinTime,
-            lateMinutes: lateReasonState.data.lateMinutes,
-            reason,
-          })
+
+        if (tenant.features.attendance && ['check in', 'checkin', 'check-in'].includes(text)) {
+          await setConvState(tenant.id, from, { step: 'awaiting_location', data: { type: 'in' } });
+          await whatsapp.requestLocation(tenant, from, '📍 Please share your location to confirm check-in.');
+          return;
+        }
+        if (tenant.features.attendance && ['check out', 'checkout', 'check-out'].includes(text)) {
+          await setConvState(tenant.id, from, { step: 'awaiting_location', data: { type: 'out' } });
+          await whatsapp.requestLocation(tenant, from, '📍 Please share your location to confirm check-out.');
+          return;
+        }
+
+        if (tenant.features.adminDashboard && isAdmin) {
+          const reply = await handleAdminCommand(tenant, text);
+          await whatsapp.sendText(tenant, from, reply);
+          return;
+        }
+
+        await whatsapp.sendText(
+          tenant,
+          from,
+          `👋 Hi! I'm the ${tenant.name} Bot.\n\nEmployees: type 'check in' or 'check out'.\nFor anything else, please contact your administrator.`
         );
-        await whatsapp.sendText(tenant, from, '✅ Reason recorded. Thank you for reporting.');
         return;
       }
 
-      if (tenant.features.attendance && ['check in', 'checkin', 'check-in'].includes(text)) {
-        const employee = await getEmployeeByPhone(tenant.id, from);
-        if (!employee) {
-          await whatsapp.sendText(tenant, from, "We couldn't find your employee record. Please contact your administrator.");
+      // ── Prospect (no bot_employees record) — demo/industry-picker flow ──
+      const demoState = await getConvState(tenant.id, from);
+      if (demoState && demoState.step === 'demo_exploring') {
+        // Only 'field' ever sets this state (see prospectDemo.js), so
+        // check-in/checkout here is always the cosmetic Field simulation
+        // — no bot_employees/attendance access at all.
+        if (['check in', 'checkin', 'check-in'].includes(text)) {
+          await whatsapp.sendText(tenant, from, simulateDemoCheckIn());
           return;
         }
-        await setConvState(tenant.id, from, { step: 'awaiting_location', data: { type: 'in' } });
-        await whatsapp.requestLocation(tenant, from, '📍 Please share your location to confirm check-in.');
-        return;
-      }
-      if (tenant.features.attendance && ['check out', 'checkout', 'check-out'].includes(text)) {
-        const employee = await getEmployeeByPhone(tenant.id, from);
-        if (!employee) {
-          await whatsapp.sendText(tenant, from, "We couldn't find your employee record. Please contact your administrator.");
+        if (['check out', 'checkout', 'check-out'].includes(text)) {
+          await whatsapp.sendText(tenant, from, simulateDemoCheckOut());
           return;
         }
-        await setConvState(tenant.id, from, { step: 'awaiting_location', data: { type: 'out' } });
-        await whatsapp.requestLocation(tenant, from, '📍 Please share your location to confirm check-out.');
+        await whatsapp.sendText(tenant, from, "Try typing 'check in' or 'check out' to see the demo in action! 👍");
         return;
       }
 
-      if (tenant.features.adminDashboard && isAdmin) {
-        const reply = await handleAdminCommand(tenant, text);
-        await whatsapp.sendText(tenant, from, reply);
-        return;
-      }
-
-      await whatsapp.sendText(
-        tenant,
-        from,
-        `👋 Hi! I'm the ${tenant.name} Bot.\n\nEmployees: type 'check in' or 'check out'.\nFor anything else, please contact your administrator.`
-      );
+      // No demo in progress — any text at all (including a bare "hi")
+      // sends the industry picker; there's no employee-record rejection
+      // for prospects anymore.
+      await sendIndustryPicker(tenant, from);
       return;
     }
 
-    // ── 3. Button/interactive replies — approve/reject on a pending request ──
+    // ── 3. List replies — prospect industry picker ────────────────────────
+    if (message.type === 'interactive' && message.interactive?.type === 'list_reply') {
+      const industryId = message.interactive.list_reply.id;
+      const result = handleIndustrySelection(industryId);
+      if (result) {
+        if (result.newConvState) {
+          await setConvState(tenant.id, from, result.newConvState);
+        }
+        await whatsapp.sendText(tenant, from, result.message);
+      }
+      return;
+    }
+
+    // ── 4. Button/interactive replies — approve/reject on a pending request ──
     // Two real Meta payload shapes, matching kapa-attendance-bot's
     // handleButtonReply for consistency: the reply-buttons format we
     // actually send via whatsapp.sendButtons comes back as
