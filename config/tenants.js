@@ -71,6 +71,12 @@ const TENANTS = [
   // },
 ];
 
+// The shared demo number prospects message on before they have a
+// tenant of their own — same env var as 'kapa's own phoneNumberId
+// above, not a separately hardcoded literal, so the two can never drift
+// out of sync with each other.
+const SHARED_DEMO_PHONE_NUMBER_ID = process.env.KAPA_PHONE_NUMBER_ID || '';
+
 function getTenantByPhoneNumberId(phoneNumberId) {
   return TENANTS.find((t) => t.phoneNumberId && t.phoneNumberId === phoneNumberId) || null;
 }
@@ -89,6 +95,7 @@ function getAllTenants() {
 
 module.exports = {
   TENANTS,
+  SHARED_DEMO_PHONE_NUMBER_ID,
   getTenantByPhoneNumberId,
   getTenantByApiKey,
   getTenantById,
