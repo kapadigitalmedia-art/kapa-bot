@@ -91,4 +91,48 @@ async function requestLocation(tenant, to, bodyText) {
   }
 }
 
-module.exports = { sendText, sendToOffice, sendToAllAdmins, requestLocation };
+/**
+ * Send an interactive reply-button message — used for approve/reject
+ * prompts (leave/expense/etc. approval). buttons is an array of
+ * {id, title} objects; WhatsApp caps this at 3, but every caller here
+ * only ever sends 2 (approve/reject).
+ */
+async function sendButtons(tenant, to, bodyText, buttons) {
+  if (!tenant) return { ok: false, error: 'Unknown tenant' };
+  if (!to) return { ok: false, error: 'Missing destination number' };
+
+  const accessToken = tenant.accessTokenOverride || config.meta.accessToken;
+  const phoneNumberId = tenant.phoneNumberId;
+
+  if (!accessToken || !phoneNumberId) {
+    logger.info(`[MOCK MODE] [${tenant.id}] Would send buttons to ${to}: ${bodyText} | buttons=${JSON.stringify(buttons)}`);
+    return { ok: true, mock: true };
+  }
+
+  const url = `https://graph.facebook.com/${config.meta.graphApiVersion}/${phoneNumberId}/messages`;
+
+  try {
+    const res = await axios.post(
+      url,
+      {
+        messaging_product: 'whatsapp',
+        to,
+        type: 'interactive',
+        interactive: {
+          type: 'button',
+          body: { text: bodyText },
+          action: { buttons: buttons.map((b) => ({ type: 'reply', reply: { id: b.id, title: b.title } })) },
+        },
+      },
+      { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' }, timeout: 15000 }
+    );
+    logger.info(`[${tenant.id}] WhatsApp buttons sent -> ${to} | messageId=${res.data?.messages?.[0]?.id || 'n/a'}`);
+    return { ok: true, data: res.data };
+  } catch (err) {
+    const detail = err.response?.data || err.message;
+    logger.error(`[${tenant.id}] WhatsApp buttons send FAILED -> ${to}`, detail);
+    return { ok: false, error: JSON.stringify(detail) };
+  }
+}
+
+module.exports = { sendText, sendToOffice, sendToAllAdmins, requestLocation, sendButtons };

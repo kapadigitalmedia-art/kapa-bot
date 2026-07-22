@@ -193,6 +193,822 @@ async function deleteConversationState(tenantId, phone) {
 }
 
 /**
+ * Employee lookup by WhatsApp number — the missing link between an
+ * incoming message ("this text is from +60...") and the employeeId/
+ * employee object every other function in this file (createCheckIn,
+ * createLeaveRequest, createTask, calculatePayroll, ...) expects.
+ * Cleans BOTH the input and the stored column via the same
+ * REPLACE(REPLACE(REPLACE(...))) pattern isEmployeeOnLeave uses below,
+ * not just the input — stored numbers aren't guaranteed to be in the
+ * same clean format an incoming message's `from` field arrives in.
+ */
+async function getEmployeeByPhone(tenantId, whatsappNumber) {
+  const clean = String(whatsappNumber || '').replace(/[\s\+\-]/g, '');
+  const [rows] = await pool.query(
+    `SELECT * FROM bot_employees
+     WHERE tenant_id = ? AND is_active = TRUE
+       AND REPLACE(REPLACE(REPLACE(whatsapp_number,'+',''),'-',''),' ','') = ?`,
+    [tenantId, clean]
+  );
+  return rows[0] || null;
+}
+
+/**
+ * Attendance (bot_employee_attendance) — like conversationState above,
+ * this doesn't fit the push/filter/takeRight log-collection shape either:
+ * it needs upsert-by-(tenant, employee, date), a targeted UPDATE, and a
+ * date-range lookup, none of which the tenantDb() chain below supports.
+ * Plain async functions instead, following the same precedent.
+ *
+ * All three TIME columns (check_in_time/check_out_time/
+ * checkin_attempt_time) come back from mysql2 as "HH:MM:SS" strings —
+ * formatAttendanceRow() trims them to "HH:MM" to match the shape the
+ * rest of the system (ported from kapa-attendance-bot's VARCHAR(10)
+ * columns) expects.
+ */
+function nowInKualaLumpur() {
+  return new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kuala_Lumpur' }));
+}
+
+function toDateStr(date) {
+  return date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0');
+}
+
+function toHoursMinutes(date) {
+  return String(date.getHours()).padStart(2, '0') + ':' + String(date.getMinutes()).padStart(2, '0');
+}
+
+function formatAttendanceRow(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    check_in_time: row.check_in_time ? row.check_in_time.slice(0, 5) : null,
+    check_out_time: row.check_out_time ? row.check_out_time.slice(0, 5) : null,
+    checkin_attempt_time: row.checkin_attempt_time ? row.checkin_attempt_time.slice(0, 5) : null,
+  };
+}
+
+/**
+ * Looks up the employee's shift_start, computes lateMinutes/status the
+ * same way kapa-attendance-bot's createCheckIn does (Asia/Kuala_Lumpur
+ * wall-clock time vs. shift_start), then upserts today's row. Returns
+ * null if employeeId doesn't belong to tenantId.
+ */
+async function createCheckIn(tenantId, employeeId, lat, lng) {
+  const [empRows] = await pool.query(
+    'SELECT full_name, whatsapp_number, shift_start FROM bot_employees WHERE id = ? AND tenant_id = ?',
+    [employeeId, tenantId]
+  );
+  if (!empRows.length) return null;
+  const employee = empRows[0];
+
+  const now = nowInKualaLumpur();
+  const dateStr = toDateStr(now);
+  const timeStr = toHoursMinutes(now);
+
+  const shiftParts = String(employee.shift_start || '08:30:00').split(':');
+  const shiftMins = parseInt(shiftParts[0] || 8, 10) * 60 + parseInt(shiftParts[1] || 30, 10);
+  const nowMins = now.getHours() * 60 + now.getMinutes();
+  const lateMinutes = nowMins > shiftMins ? nowMins - shiftMins : 0;
+  const status = lateMinutes > 0 ? 'Late' : 'Present';
+
+  await pool.execute(
+    `INSERT INTO bot_employee_attendance
+       (tenant_id, employee_id, employee_name, whatsapp_number, attendance_date,
+        check_in_time, check_in_latitude, check_in_longitude, attendance_status, late_minutes)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+       check_in_time = VALUES(check_in_time),
+       check_in_latitude = VALUES(check_in_latitude),
+       check_in_longitude = VALUES(check_in_longitude),
+       attendance_status = VALUES(attendance_status),
+       late_minutes = VALUES(late_minutes)`,
+    [tenantId, employeeId, employee.full_name, employee.whatsapp_number, dateStr, timeStr, lat ?? null, lng ?? null, status, lateMinutes]
+  );
+
+  return getTodayAttendance(tenantId, employeeId);
+}
+
+/**
+ * Returns null (rather than throwing) if there's no check-in row for
+ * today to check out against — mirrors createCheckIn's "not found"
+ * signal shape.
+ */
+async function updateCheckOut(tenantId, employeeId, lat, lng) {
+  const now = nowInKualaLumpur();
+  const dateStr = toDateStr(now);
+  const timeStr = toHoursMinutes(now);
+
+  const [result] = await pool.execute(
+    `UPDATE bot_employee_attendance
+     SET check_out_time = ?, check_out_latitude = ?, check_out_longitude = ?
+     WHERE tenant_id = ? AND employee_id = ? AND attendance_date = ?`,
+    [timeStr, lat ?? null, lng ?? null, tenantId, employeeId, dateStr]
+  );
+  if (result.affectedRows === 0) return null;
+  return getTodayAttendance(tenantId, employeeId);
+}
+
+async function getTodayAttendance(tenantId, employeeId) {
+  const dateStr = toDateStr(nowInKualaLumpur());
+  const [rows] = await pool.query(
+    'SELECT * FROM bot_employee_attendance WHERE tenant_id = ? AND employee_id = ? AND attendance_date = ?',
+    [tenantId, employeeId, dateStr]
+  );
+  return formatAttendanceRow(rows[0]);
+}
+
+/**
+ * month is 1-12 (not the source's 3-letter-name format). End-of-month day
+ * is computed via `new Date(year, month, 0)` rather than the source's
+ * hardcoded "-31", since that's an existing latent imprecision in
+ * kapa-attendance-bot (months with fewer than 31 days get an invalid
+ * date-string upper bound) not worth reproducing here.
+ */
+async function getMonthAttendance(tenantId, employeeId, year, month) {
+  const monthStr = String(month).padStart(2, '0');
+  const dateFrom = `${year}-${monthStr}-01`;
+  const lastDay = new Date(year, month, 0).getDate();
+  const dateTo = `${year}-${monthStr}-${String(lastDay).padStart(2, '0')}`;
+
+  const [rows] = await pool.query(
+    `SELECT * FROM bot_employee_attendance
+     WHERE tenant_id = ? AND employee_id = ? AND attendance_date BETWEEN ? AND ?
+     ORDER BY attendance_date`,
+    [tenantId, employeeId, dateFrom, dateTo]
+  );
+  return rows.map(formatAttendanceRow);
+}
+
+/**
+ * Leave requests (bot_leave_requests) — plain async functions, same
+ * precedent as attendance above. Deliberately does NOT compute
+ * first_approver here (the source's getLeaveFirstApprover per-employee
+ * hardcoded routing) — that's Tier 3 approval-chain work deferred per
+ * migration 010's header comment, left null until bot_approval_chains
+ * integration happens.
+ */
+
+/**
+ * "Emergency Leave" is remapped to "Unpaid Leave" before it's stored —
+ * same as the source — but only for the DB write; the caller's original
+ * leaveType is never touched, only what lands in the database changes.
+ */
+async function createLeaveRequest(tenantId, employee, leaveType, startDate, endDate, totalDays, reason) {
+  try {
+    const dbLeaveType = leaveType === 'Emergency Leave' ? 'Unpaid Leave' : leaveType;
+
+    const [result] = await pool.execute(
+      `INSERT INTO bot_leave_requests
+         (tenant_id, employee_id, employee_name, whatsapp_number, leave_type,
+          start_date, end_date, total_days, reason, first_approver)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [tenantId, employee.id, employee.full_name, employee.whatsapp_number, dbLeaveType,
+       startDate, endDate, totalDays || 1, reason, null]
+    );
+    const insertId = result.insertId;
+
+    // must check === null/undefined explicitly — String(null) is truthy, which
+    // caused a real production incident where a leave request never reached
+    // the DB but the bot reported success anyway
+    if (insertId === null || insertId === undefined) {
+      return null;
+    }
+
+    return { id: insertId };
+  } catch (err) {
+    return null;
+  }
+}
+
+async function updateLeaveStatus(tenantId, recordId, status, approvedBy) {
+  const [result] = await pool.execute(
+    `UPDATE bot_leave_requests SET approval_status = ?, approved_by = ?, approved_at = NOW()
+     WHERE id = ? AND tenant_id = ?`,
+    [status, approvedBy || null, recordId, tenantId]
+  );
+  return result.affectedRows > 0;
+}
+
+/**
+ * whatsappNumber is stripped of spaces/+/- before comparing, matching
+ * the source's REPLACE(REPLACE(REPLACE(...))) chain — done on both
+ * sides so inconsistently-formatted stored numbers still match.
+ */
+async function isEmployeeOnLeave(tenantId, whatsappNumber) {
+  const clean = String(whatsappNumber || '').replace(/[\s\+\-]/g, '');
+  const dateStr = toDateStr(nowInKualaLumpur());
+  const [rows] = await pool.query(
+    `SELECT * FROM bot_leave_requests
+     WHERE REPLACE(REPLACE(REPLACE(whatsapp_number,'+',''),'-',''),' ','') = ?
+       AND approval_status = 'Approved' AND start_date <= ? AND end_date >= ? AND tenant_id = ?`,
+    [clean, dateStr, dateStr, tenantId]
+  );
+  return rows.length > 0;
+}
+
+async function isEmployeeOnLeaveOnDate(tenantId, whatsappNumber, dateStr) {
+  const clean = String(whatsappNumber || '').replace(/[\s\+\-]/g, '');
+  if (!dateStr) return false;
+  const [rows] = await pool.query(
+    `SELECT * FROM bot_leave_requests
+     WHERE REPLACE(REPLACE(REPLACE(whatsapp_number,'+',''),'-',''),' ','') = ?
+       AND approval_status = 'Approved' AND start_date <= ? AND end_date >= ? AND tenant_id = ?`,
+    [clean, dateStr, dateStr, tenantId]
+  );
+  return rows.length > 0;
+}
+
+/**
+ * Matches the getRequestSummaryFn(tenantId, requestType, recordId)
+ * contract services/approvalEngine.js expects. Uses DATE_FORMAT in SQL
+ * rather than formatting start_date/end_date on the JS side — mysql2
+ * returns DATE columns as JS Date objects by default, and converting
+ * those to strings client-side (e.g. toISOString()) re-introduces the
+ * exact UTC-offset date-shifting artifact seen earlier this session
+ * (a stored "2026-08-01" displaying as "2026-07-31T18:30:00.000Z").
+ * DATE_FORMAT sidesteps it entirely by never producing a JS Date at all.
+ */
+async function getLeaveRequestSummary(tenantId, requestType, recordId) {
+  const [rows] = await pool.query(
+    `SELECT employee_name, leave_type, reason, total_days,
+            DATE_FORMAT(start_date, '%Y-%m-%d') AS start_date_fmt,
+            DATE_FORMAT(end_date, '%Y-%m-%d') AS end_date_fmt
+     FROM bot_leave_requests WHERE id = ? AND tenant_id = ?`,
+    [recordId, tenantId]
+  );
+  if (!rows.length) return 'Leave request details unavailable.';
+  const leave = rows[0];
+  return `📋 Leave Request\n\n👤 ${leave.employee_name || 'Employee'}\n📅 ${leave.start_date_fmt} to ${leave.end_date_fmt} (${leave.total_days} day(s))\n🏷️ ${leave.leave_type}\n📝 ${leave.reason || '-'}`;
+}
+
+/**
+ * Expense claims (bot_expense_claims) — plain async functions, same
+ * precedent as leave above.
+ */
+
+/**
+ * applying the same defensive check discovered necessary for leave requests -
+ * this class of bug (truthy-but-invalid insertId) could affect any INSERT.
+ * The source's expense_claims INSERT never had this check at all — unlike
+ * leave requests, which got it after the documented Sharifah incident —
+ * db.js's createExpenseClaim wraps result.insertId into { id: ... }
+ * unconditionally, and index.js's wrapper only checks the returned object
+ * itself is truthy, never that .id is a real value. Fixing it here even
+ * though the source never caught it for expenses.
+ */
+async function createExpenseClaim(tenantId, employee, expenseType, amount, expenseDate, description, receiptUrl) {
+  try {
+    const [result] = await pool.execute(
+      `INSERT INTO bot_expense_claims
+         (tenant_id, employee_id, employee_name, whatsapp_number, expense_type, amount, expense_date, description, receipt_url)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [tenantId, employee.id, employee.full_name, employee.whatsapp_number, expenseType, amount || 0, expenseDate || null, description || null, receiptUrl || null]
+    );
+    const insertId = result.insertId;
+
+    if (insertId === null || insertId === undefined) {
+      return null;
+    }
+
+    return { id: insertId };
+  } catch (err) {
+    return null;
+  }
+}
+
+// Unlike updateLeaveStatus, this also sets approved_at — the source's
+// updateExpenseStatus never had that column to set (see migration 018's
+// header: approved_at was added to bot_expense_claims for consistency
+// with the other approval-tracked tables even though the source lacks it).
+async function updateExpenseStatus(tenantId, recordId, status, approvedBy) {
+  const [result] = await pool.execute(
+    `UPDATE bot_expense_claims SET status = ?, approved_by = ?, approved_at = NOW()
+     WHERE id = ? AND tenant_id = ?`,
+    [status, approvedBy || null, recordId, tenantId]
+  );
+  return result.affectedRows > 0;
+}
+
+async function getExpenseRequestSummary(tenantId, requestType, recordId) {
+  const [rows] = await pool.query(
+    `SELECT employee_name, expense_type, amount, description,
+            DATE_FORMAT(expense_date, '%Y-%m-%d') AS expense_date_fmt
+     FROM bot_expense_claims WHERE id = ? AND tenant_id = ?`,
+    [recordId, tenantId]
+  );
+  if (!rows.length) return 'Expense claim details unavailable.';
+  const exp = rows[0];
+  return `💸 Expense Claim\n\n👤 ${exp.employee_name || 'Employee'}\n🏷️ ${exp.expense_type}\n💰 RM ${Number(exp.amount).toFixed(2)}\n📅 ${exp.expense_date_fmt}\n📝 ${exp.description || '-'}`;
+}
+
+/**
+ * Tasks (bot_tasks + bot_task_assignments) — plain async functions, same
+ * precedent as attendance/leave above. Assignment is a join table now
+ * (unbounded, not the source's fixed staff/staff2 slots), so every read
+ * that returns a task also resolves its assignees via a second query —
+ * factored into getTaskAssignees() so getTaskById and getTodayTasks
+ * don't duplicate that join.
+ */
+async function getTaskAssignees(taskId) {
+  const [rows] = await pool.query(
+    `SELECT e.id, e.full_name, e.whatsapp_number
+     FROM bot_task_assignments ta
+     JOIN bot_employees e ON e.id = ta.employee_id
+     WHERE ta.task_id = ?`,
+    [taskId]
+  );
+  return rows;
+}
+
+/**
+ * Note: the task INSERT and the per-assignee bot_task_assignments
+ * INSERTs are not wrapped in a single transaction — if an assignment
+ * insert fails partway through assigneeEmployeeIds, the task row and
+ * any earlier-succeeded assignments remain, even though this function
+ * returns null (matching the source's plain try/catch style rather than
+ * adding transaction handling not present anywhere else in this file).
+ */
+async function createTask(tenantId, taskData, assigneeEmployeeIds) {
+  try {
+    const [result] = await pool.execute(
+      `INSERT INTO bot_tasks
+         (tenant_id, task_name, customer_name, customer_whatsapp, customer_address,
+          customer_lat, customer_lng, date_field, appointment_time)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [tenantId, taskData.task_name, taskData.customer_name, taskData.customer_whatsapp ?? null,
+       taskData.customer_address ?? null, taskData.customer_lat ?? null, taskData.customer_lng ?? null,
+       taskData.date_field, taskData.appointment_time ?? null]
+    );
+    const taskId = result.insertId;
+
+    // applying the same defensive check discovered necessary for leave requests -
+    // this class of bug (truthy-but-invalid insertId) could affect any INSERT
+    if (taskId === null || taskId === undefined) {
+      return null;
+    }
+
+    if (Array.isArray(assigneeEmployeeIds) && assigneeEmployeeIds.length) {
+      for (const employeeId of assigneeEmployeeIds) {
+        await pool.execute('INSERT INTO bot_task_assignments (task_id, employee_id) VALUES (?, ?)', [taskId, employeeId]);
+      }
+    }
+
+    return { id: taskId };
+  } catch (err) {
+    return null;
+  }
+}
+
+async function getTaskById(tenantId, taskId) {
+  const [rows] = await pool.query('SELECT * FROM bot_tasks WHERE id = ? AND tenant_id = ?', [taskId, tenantId]);
+  if (!rows.length) return null;
+
+  const assignees = await getTaskAssignees(taskId);
+  return { ...rows[0], assignees };
+}
+
+/**
+ * Same conditional-field whitelist pattern as the source's
+ * DB.updateTaskStatus, plus the 4 new completion-capture columns
+ * (end_time/completion_notes/completion_time/manager_approved_by) that
+ * migration 011 added — each only included in the UPDATE if present in
+ * extraData, same as the source's if(data.x) checks.
+ */
+async function updateTaskStatus(tenantId, taskId, status, extraData) {
+  const fields = ['status = ?'];
+  const values = [status];
+
+  if (extraData) {
+    if (extraData.work_photo_url) { fields.push('work_photo_url = ?'); values.push(extraData.work_photo_url); }
+    if (extraData.work_summary) { fields.push('work_summary = ?'); values.push(extraData.work_summary); }
+    if (extraData.rework_reason) { fields.push('rework_reason = ?'); values.push(extraData.rework_reason); }
+    if (extraData.customer_notified) { fields.push('customer_notified = ?'); values.push(extraData.customer_notified); }
+    if (extraData.ai_summary) { fields.push('ai_summary = ?'); values.push(extraData.ai_summary); }
+    if (extraData.end_time) { fields.push('end_time = ?'); values.push(extraData.end_time); }
+    if (extraData.completion_notes) { fields.push('completion_notes = ?'); values.push(extraData.completion_notes); }
+    if (extraData.completion_time) { fields.push('completion_time = ?'); values.push(extraData.completion_time); }
+    if (extraData.manager_approved_by) { fields.push('manager_approved_by = ?'); values.push(extraData.manager_approved_by); }
+  }
+
+  values.push(taskId, tenantId);
+  const [result] = await pool.execute(`UPDATE bot_tasks SET ${fields.join(', ')} WHERE id = ? AND tenant_id = ?`, values);
+  return result.affectedRows > 0;
+}
+
+async function getTodayTasks(tenantId) {
+  const dateStr = toDateStr(nowInKualaLumpur());
+  const [rows] = await pool.query(
+    `SELECT * FROM bot_tasks
+     WHERE tenant_id = ? AND date_field = ? AND status NOT IN ('Completed','Cancelled')
+     ORDER BY appointment_time`,
+    [tenantId, dateStr]
+  );
+
+  const tasks = [];
+  for (const row of rows) {
+    const assignees = await getTaskAssignees(row.id);
+    tasks.push({ ...row, assignees });
+  }
+  return tasks;
+}
+
+/**
+ * Payroll (bot_payroll_records) — plain async functions, same precedent
+ * as attendance/leave/tasks above.
+ *
+ * MONTHS/MALAYSIA_PUBLIC_HOLIDAYS/isPublicHoliday/isSunday/
+ * formatZohoDate/getWorkingDaysInMonth are all carried over from
+ * kapa-attendance-bot's index.js essentially unchanged — this logic
+ * isn't statutory-rate-dependent, so it isn't part of the
+ * country-configurable design below.
+ *
+ * FLAGGING, NOT FIXING: MALAYSIA_PUBLIC_HOLIDAYS is a hardcoded,
+ * single-country, single-year (2026 only) date list carried over
+ * verbatim from source. This is calendar data just as
+ * tenant/country-specific as the statutory rates bot_statutory_components
+ * was built to make configurable, but it isn't a DB table yet — same
+ * "correct for today, revisit later" tradeoff already made for
+ * bot_payroll_records' MY-specific columns.
+ *
+ * INTERFACE ADAPTATION: the source's getWorkingDaysInMonth takes month
+ * as a 3-letter name ("Jul") via MONTHS.indexOf(month) — adapted here to
+ * the same 1-12 number convention getMonthAttendance already uses
+ * elsewhere in this file, rather than mixing two month conventions
+ * across the new codebase. The day-counting/public-holiday/
+ * alternate-Saturday (2nd & 4th only) logic itself is untouched.
+ */
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+const MALAYSIA_PUBLIC_HOLIDAYS = [
+  '01-Jan-2026', '29-Jan-2026', '30-Jan-2026', '01-Feb-2026', '20-Mar-2026',
+  '19-Apr-2026', '20-Apr-2026', '01-May-2026', '26-May-2026', '05-Jun-2026',
+  '26-Jun-2026', '17-Jul-2026', '31-Aug-2026', '16-Sep-2026', '25-Sep-2026',
+  '20-Oct-2026', '25-Dec-2026',
+];
+
+function formatZohoDate(date) {
+  const d = new Date(new Date(date).toLocaleString('en-US', { timeZone: 'Asia/Kuala_Lumpur' }));
+  return String(d.getDate()).padStart(2, '0') + '-' + MONTHS[d.getMonth()] + '-' + d.getFullYear();
+}
+
+function isPublicHoliday(date) {
+  const d = new Date(new Date(date).toLocaleString('en-US', { timeZone: 'Asia/Kuala_Lumpur' }));
+  return MALAYSIA_PUBLIC_HOLIDAYS.includes(formatZohoDate(d));
+}
+
+function isSunday(date) {
+  const d = new Date(new Date(date).toLocaleString('en-US', { timeZone: 'Asia/Kuala_Lumpur' }));
+  return d.getDay() === 0;
+}
+
+function getWorkingDaysInMonth(month, year) {
+  const monthIndex = month - 1;
+  const daysInMonth = new Date(year, monthIndex + 1, 0).getDate();
+  let workingDays = 0;
+  for (let d = 1; d <= daysInMonth; d++) {
+    const date = new Date(year, monthIndex, d);
+    const day = date.getDay();
+    if (day === 0) continue;
+    if (isPublicHoliday(formatZohoDate(date))) continue;
+    if (day === 6) { const w = Math.ceil(d / 7); if (w !== 2 && w !== 4) continue; }
+    workingDays++;
+  }
+  return workingDays;
+}
+
+/**
+ * month/year here are the payroll period. The statutory lookup below is
+ * keyed to that period's date (first of the month), not today's real
+ * date — so recalculating a past period after a rate change correctly
+ * applies the rate that was in effect during that period, not whatever
+ * is active today.
+ *
+ * Returns a generic `contributions` map keyed by component_code (e.g.
+ * EPF/SOCSO/EIS for Malaysia today), not named epfEmployee/socsoEmployee
+ * fields — adding a new country's components to bot_statutory_components
+ * requires no changes here, only to whatever maps `contributions` onto
+ * bot_payroll_records' MY-specific columns (createPayrollRecord, below).
+ */
+async function calculatePayroll(tenantId, employee, month, year, allowance) {
+  const basicSalary = parseFloat(employee.salary || 0);
+  const fixedAllowance = parseFloat(employee.fixed_allowance || allowance || 0);
+  const hourlyRate = basicSalary / 26 / 8;
+  let otAmount = 0;
+  let totalLateMinutes = 0;
+  let presentDays = 0;
+
+  const attendances = await getMonthAttendance(tenantId, employee.id, year, month);
+  const workingDays = getWorkingDaysInMonth(month, year);
+
+  for (const att of attendances) {
+    const status = String(att.attendance_status || '').toLowerCase();
+    if (['present', 'late', 'completed', 'wfh', 'checked in'].includes(status)) presentDays++;
+    const lateMin = parseFloat(att.late_minutes || 0);
+    if (lateMin > 0) totalLateMinutes += lateMin;
+    const otMin = parseFloat(att.ot_minutes || 0);
+    if (otMin > 0) {
+      const otHours = otMin / 60;
+      const otType = String(att.ot_type || 'Normal');
+      const otDate = att.attendance_date;
+      if (otType === 'Public Holiday' || isPublicHoliday(otDate)) otAmount += hourlyRate * 3.0 * otHours;
+      else if (otType === 'Sunday' || isSunday(otDate)) otAmount += hourlyRate * 2.0 * otHours;
+      else otAmount += hourlyRate * 1.5 * otHours;
+    }
+  }
+
+  const absentDays = Math.max(0, workingDays - presentDays);
+
+  const [tenantRows] = await pool.query('SELECT country_code FROM bot_tenants WHERE tenant_id = ?', [tenantId]);
+  const countryCode = tenantRows.length ? tenantRows[0].country_code : null;
+
+  const periodDate = `${year}-${String(month).padStart(2, '0')}-01`;
+  const [components] = await pool.query(
+    `SELECT * FROM bot_statutory_components
+     WHERE country_code = ? AND is_active = TRUE
+       AND effective_from <= ? AND (effective_to IS NULL OR effective_to >= ?)`,
+    [countryCode, periodDate, periodDate]
+  );
+
+  const contributions = {};
+  for (const component of components) {
+    let employeeAmt = 0;
+    let employerAmt = 0;
+
+    if (component.calculation_type === 'percentage') {
+      employeeAmt = basicSalary * Number(component.employee_rate);
+      if (component.employee_cap !== null) employeeAmt = Math.min(employeeAmt, Number(component.employee_cap));
+      employerAmt = basicSalary * Number(component.employer_rate);
+      if (component.employer_cap !== null) employerAmt = Math.min(employerAmt, Number(component.employer_cap));
+    } else if (component.calculation_type === 'bracket') {
+      // wage_from < salary <= wage_to — same boundary convention documented in migration 006
+      const [brackets] = await pool.query(
+        `SELECT * FROM bot_statutory_brackets
+         WHERE component_id = ? AND wage_from < ? AND (wage_to IS NULL OR wage_to >= ?)
+         ORDER BY wage_from LIMIT 1`,
+        [component.id, basicSalary, basicSalary]
+      );
+      if (brackets.length) {
+        employeeAmt = Number(brackets[0].employee_amount);
+        employerAmt = Number(brackets[0].employer_amount);
+      }
+    }
+
+    contributions[component.component_code] = { employee: employeeAmt, employer: employerAmt };
+  }
+
+  const totalDeduction = Object.values(contributions).reduce((sum, c) => sum + c.employee, 0);
+  const grossSalary = basicSalary + fixedAllowance + otAmount;
+  const netSalary = Math.max(0, grossSalary - totalDeduction);
+
+  return {
+    basicSalary,
+    allowance: fixedAllowance,
+    otAmount,
+    contributions,
+    deduction: totalDeduction,
+    grossSalary,
+    finalSalary: netSalary,
+    lateMinutes: totalLateMinutes,
+    absentDays,
+    presentDays,
+    workingDays,
+  };
+}
+
+/**
+ * THIS is where the MY-specific mapping happens — from the generic
+ * `contributions` object (keyed by component_code) to
+ * bot_payroll_records' named columns (epf_employee, socso, eis, etc.).
+ * This is exactly the tension flagged when bot_payroll_records was
+ * designed: adding a new country's components to
+ * bot_statutory_components does NOT automatically get a place to land
+ * here — this mapping would need extending too, or the table redesigned.
+ *
+ * month is converted from calculatePayroll's numeric (1-12) convention
+ * to the 3-letter name bot_payroll_records.month (VARCHAR(10)) actually
+ * stores, matching what the rest of the system displays/looks up by.
+ */
+async function createPayrollRecord(tenantId, employeeId, month, year, payrollResult) {
+  try {
+    const [empRows] = await pool.query(
+      'SELECT full_name, whatsapp_number FROM bot_employees WHERE id = ? AND tenant_id = ?',
+      [employeeId, tenantId]
+    );
+    if (!empRows.length) return null;
+    const employee = empRows[0];
+
+    const c = payrollResult.contributions || {};
+    const epf = c.EPF || { employee: 0, employer: 0 };
+    const socso = c.SOCSO || { employee: 0, employer: 0 };
+    const eis = c.EIS || { employee: 0, employer: 0 };
+    const monthName = MONTHS[month - 1] || month;
+
+    const [result] = await pool.execute(
+      `INSERT INTO bot_payroll_records
+         (tenant_id, employee_id, employee_name, whatsapp_number, month, year,
+          basic_salary, allowance, overtime, deductions,
+          epf_employee, epf_employer, socso, socso_employer, eis, eis_employer,
+          net_salary, gross_salary, late_minutes, working_days, present_days, absent_days)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        tenantId, employeeId, employee.full_name, employee.whatsapp_number, monthName, year,
+        payrollResult.basicSalary, payrollResult.allowance, payrollResult.otAmount, payrollResult.deduction,
+        epf.employee, epf.employer, socso.employee, socso.employer, eis.employee, eis.employer,
+        payrollResult.finalSalary, payrollResult.grossSalary, payrollResult.lateMinutes,
+        payrollResult.workingDays, payrollResult.presentDays, payrollResult.absentDays,
+      ]
+    );
+    const insertId = result.insertId;
+
+    // same defensive check discovered necessary for leave requests -
+    // this class of bug (truthy-but-invalid insertId) could affect any INSERT
+    if (insertId === null || insertId === undefined) {
+      return null;
+    }
+
+    return { id: insertId };
+  } catch (err) {
+    return null;
+  }
+}
+
+/**
+ * Approval chain resolution (bot_approval_chains) — the most-specific-
+ * first tier lookup verified by hand against 3 real scenarios earlier
+ * this session (Thinesshvaran/Emergency Leave, Lob/late_reason,
+ * Selvan/normal leave), now as a reusable function instead of ad-hoc
+ * queries. subtype/role being null/undefined means "no preference" —
+ * callers should never pass the literal string '*' themselves, that's
+ * the internal DB sentinel this function matches against, not a caller
+ * input.
+ *
+ * Returns ALL rows at the single winning tier (every step_order, both
+ * cc_only true/false) — not just the first step — since callers need
+ * the full tier to know about later steps and any cc rows sharing a
+ * step_order with the real approver.
+ *
+ * is_active = TRUE is applied on every tier query — a soft-disabled
+ * chain row shouldn't be considered a match, matching what that column
+ * is evidently for even though this wasn't explicitly requested.
+ */
+async function resolveTier(tenantId, requestType, subtype, role) {
+  const tiers = [];
+  if (subtype && role) tiers.push([subtype, role]);
+  if (subtype) tiers.push([subtype, '*']);
+  if (role) tiers.push(['*', role]);
+  tiers.push(['*', '*']);
+
+  for (const [subtypeVal, roleVal] of tiers) {
+    const [rows] = await pool.query(
+      `SELECT * FROM bot_approval_chains
+       WHERE tenant_id = ? AND request_type = ? AND applies_to_subtype = ? AND applies_to_role = ? AND is_active = TRUE
+       ORDER BY step_order`,
+      [tenantId, requestType, subtypeVal, roleVal]
+    );
+    if (rows.length) return rows;
+  }
+  return [];
+}
+
+/**
+ * Resolves a single bot_approval_chains row down to an actual WhatsApp
+ * number, given the employee who made the request (needed for
+ * requester_manager resolution). Returns null if unresolvable (e.g. the
+ * requester has no manager set, or a referenced employee no longer
+ * exists/is inactive).
+ *
+ * OPEN QUESTION, NOT DECIDED — approver_type='role': if multiple active
+ * employees share a role, which one should receive it? All of them
+ * (fan-out)? A deterministic single pick, and by what criterion (there's
+ * no seniority/priority field on bot_employees today)? Or should
+ * multiple people sharing a role used as an approver_type='role' target
+ * be treated as a data-integrity problem to prevent elsewhere, not a
+ * runtime resolution question? This is genuinely unexercised — no
+ * seeded chain row uses approver_type='role' at all (verified via a
+ * live query before writing this). The implementation below picks the
+ * lowest-id active employee with that role as a PLACEHOLDER so the
+ * function has defined behavior rather than silently returning null or
+ * throwing — it is an arbitrary tie-break, not a considered answer, and
+ * should be revisited before any real chain uses approver_type='role'.
+ */
+async function resolveApprover(chainRow, requesterEmployee) {
+  if (chainRow.approver_type === 'requester_manager') {
+    if (!requesterEmployee.reports_to_employee_id) return null;
+    const [rows] = await pool.query(
+      'SELECT whatsapp_number FROM bot_employees WHERE id = ? AND tenant_id = ?',
+      [requesterEmployee.reports_to_employee_id, requesterEmployee.tenant_id]
+    );
+    return rows.length ? rows[0].whatsapp_number : null;
+  }
+
+  if (chainRow.approver_type === 'employee') {
+    const [rows] = await pool.query(
+      'SELECT whatsapp_number FROM bot_employees WHERE id = ? AND tenant_id = ?',
+      [chainRow.approver_employee_id, requesterEmployee.tenant_id]
+    );
+    return rows.length ? rows[0].whatsapp_number : null;
+  }
+
+  if (chainRow.approver_type === 'role') {
+    // PLACEHOLDER tie-break — see the open question above.
+    const [rows] = await pool.query(
+      'SELECT whatsapp_number FROM bot_employees WHERE tenant_id = ? AND role = ? AND is_active = TRUE ORDER BY id LIMIT 1',
+      [requesterEmployee.tenant_id, chainRow.approver_role]
+    );
+    return rows.length ? rows[0].whatsapp_number : null;
+  }
+
+  return null;
+}
+
+/**
+ * Small data-access helpers approvalEngine.js needs and nothing else in
+ * this file previously exposed: a chain row by its own id (the button
+ * ID carries chain_id, not the tier's discriminators), a full employee
+ * row by id (resolveApprover's internal lookups only ever needed
+ * whatsapp_number, but the engine needs the whole row as
+ * requesterEmployee), and "is there a step after this one in the same
+ * resolved tier" (advancing needs the SAME applies_to_subtype/
+ * applies_to_role as the current row, not a fresh most-specific-first
+ * resolution — the tier was already decided once, at creation time).
+ */
+async function getChainRowById(chainId) {
+  const [rows] = await pool.query('SELECT * FROM bot_approval_chains WHERE id = ?', [chainId]);
+  return rows[0] || null;
+}
+
+async function getEmployeeById(tenantId, employeeId) {
+  const [rows] = await pool.query('SELECT * FROM bot_employees WHERE id = ? AND tenant_id = ?', [employeeId, tenantId]);
+  return rows[0] || null;
+}
+
+async function getNextStepRows(tenantId, requestType, subtype, role, afterStepOrder) {
+  const [rows] = await pool.query(
+    `SELECT * FROM bot_approval_chains
+     WHERE tenant_id = ? AND request_type = ? AND applies_to_subtype = ? AND applies_to_role = ?
+       AND step_order > ? AND is_active = TRUE
+     ORDER BY step_order`,
+    [tenantId, requestType, subtype, role, afterStepOrder]
+  );
+  return rows;
+}
+
+/**
+ * bot_approval_progress — plain CRUD helpers only. The orchestration
+ * (when to create/advance/complete a progress row, resolving the next
+ * approver, sending buttons) lives in services/approvalEngine.js, not
+ * here, consistent with everything else in this file being data access
+ * rather than business logic.
+ */
+async function createApprovalProgress(tenantId, requestType, recordId, requesterEmployeeId, stepOrder, chainId) {
+  const [result] = await pool.execute(
+    `INSERT INTO bot_approval_progress
+       (tenant_id, request_type, record_id, requester_employee_id, current_step_order, current_chain_id)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [tenantId, requestType, recordId, requesterEmployeeId, stepOrder, chainId]
+  );
+  return result.insertId;
+}
+
+async function getApprovalProgress(tenantId, requestType, recordId) {
+  const [rows] = await pool.query(
+    'SELECT * FROM bot_approval_progress WHERE tenant_id = ? AND request_type = ? AND record_id = ?',
+    [tenantId, requestType, recordId]
+  );
+  return rows[0] || null;
+}
+
+/**
+ * expectedStepOrder is a compare-and-swap guard, not just an extra
+ * filter: first-responder-wins tiers (multiple approver rows at one
+ * step_order — e.g. task_completion's two managers) mean two replies
+ * can both read the same 'in_progress' row before either write lands.
+ * Requiring current_step_order to still match what the caller's earlier
+ * read saw makes only ONE of the two concurrent UPDATEs actually affect
+ * a row; the loser's affectedRows === 0 tells approvalEngine.js it lost
+ * the race, instead of trusting the earlier read alone (which both
+ * replies would have seen as "still in progress").
+ */
+async function advanceApprovalProgress(tenantId, requestType, recordId, expectedStepOrder, stepOrder, chainId) {
+  const [result] = await pool.execute(
+    `UPDATE bot_approval_progress SET current_step_order = ?, current_chain_id = ?
+     WHERE tenant_id = ? AND request_type = ? AND record_id = ? AND status = 'in_progress' AND current_step_order = ?`,
+    [stepOrder, chainId, tenantId, requestType, recordId, expectedStepOrder]
+  );
+  return result.affectedRows > 0;
+}
+
+async function completeApprovalProgress(tenantId, requestType, recordId, expectedStepOrder) {
+  const [result] = await pool.execute(
+    `UPDATE bot_approval_progress SET status = 'completed'
+     WHERE tenant_id = ? AND request_type = ? AND record_id = ? AND status = 'in_progress' AND current_step_order = ?`,
+    [tenantId, requestType, recordId, expectedStepOrder]
+  );
+  return result.affectedRows > 0;
+}
+
+/**
  * Mirrors tenantDb(tenantId) from services/db.js for the four append-only
  * log collections (attendance, leads, errors, subscriptions). Every
  * terminal method (.write() / .value()) returns a Promise where the
@@ -245,4 +1061,38 @@ function tenantDb(tenantId) {
   };
 }
 
-module.exports = { pool, tenantDb, getConversationState, setConversationState, deleteConversationState };
+module.exports = {
+  pool,
+  tenantDb,
+  getConversationState,
+  setConversationState,
+  deleteConversationState,
+  getEmployeeByPhone,
+  createCheckIn,
+  updateCheckOut,
+  getTodayAttendance,
+  getMonthAttendance,
+  createLeaveRequest,
+  updateLeaveStatus,
+  isEmployeeOnLeave,
+  isEmployeeOnLeaveOnDate,
+  getLeaveRequestSummary,
+  createExpenseClaim,
+  updateExpenseStatus,
+  getExpenseRequestSummary,
+  createTask,
+  getTaskById,
+  updateTaskStatus,
+  getTodayTasks,
+  calculatePayroll,
+  createPayrollRecord,
+  resolveTier,
+  resolveApprover,
+  getChainRowById,
+  getEmployeeById,
+  getNextStepRows,
+  createApprovalProgress,
+  getApprovalProgress,
+  advanceApprovalProgress,
+  completeApprovalProgress,
+};

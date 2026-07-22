@@ -8,10 +8,18 @@ const {
   getConversationState: getConversationStateMysql,
   setConversationState: setConversationStateMysql,
   deleteConversationState: deleteConversationStateMysql,
+  getEmployeeByPhone,
+  createCheckIn,
+  updateCheckOut,
+  resolveTier,
 } = require('../services/db-mysql');
 const logger = require('../utils/logger');
-const { recordAttendance } = require('./attendance');
 const { handleAdminCommand } = require('../services/adminCommands');
+const { handleLeaveApprovalReply } = require('../services/leaveApproval');
+const { handleExpenseApprovalReply } = require('../services/expenseApproval');
+const { handleTaskCompletionApprovalReply } = require('../services/taskCompletion');
+const { broadcastNotifyOnly } = require('../services/approvalEngine');
+const { getLateReasonSummary } = require('../services/lateReason');
 
 /**
  * conversationState is live, mid-conversation state for a real person
@@ -102,19 +110,65 @@ router.post('/', async (req, res) => {
     if (message.type === 'location') {
       const state = await getConvState(tenant.id, from);
       if (state && state.step === 'awaiting_location') {
-        const record = await recordAttendance(tenant.id, {
-          phone: from,
-          name: contactName,
-          type: state.data.type,
-          lat: message.location.latitude,
-          lng: message.location.longitude,
-        });
-        await deleteConvState(tenant.id, from);
-        await whatsapp.sendText(
-          tenant,
-          from,
-          `✅ *Check-${record.type === 'in' ? 'In' : 'Out'} Recorded*\n\nTime: ${new Date(record.timestamp).toLocaleTimeString()}\nLocation received. Thank you!`
-        );
+        const employee = await getEmployeeByPhone(tenant.id, from);
+        if (!employee) {
+          await deleteConvState(tenant.id, from);
+          await whatsapp.sendText(tenant, from, "We couldn't find your employee record. Please contact your admin.");
+          return;
+        }
+
+        const lat = message.location.latitude;
+        const lng = message.location.longitude;
+
+        if (state.data.type === 'in') {
+          const record = await createCheckIn(tenant.id, employee.id, lat, lng);
+          await deleteConvState(tenant.id, from);
+          if (!record) {
+            await whatsapp.sendText(tenant, from, '❌ Check-in failed. Please try again or contact your admin.');
+            return;
+          }
+          const statusLabel = record.attendance_status === 'Late'
+            ? `Late (${record.late_minutes} min)`
+            : record.attendance_status;
+          await whatsapp.sendText(
+            tenant,
+            from,
+            `✅ *Checked In*\n\nTime: ${record.check_in_time}\nStatus: ${statusLabel}`
+          );
+
+          // Late-reason prompt — triggers on record.attendance_status === 'Late'
+          // rather than the source's hardcoded totalMin > 510 (8:30am) check.
+          // createCheckIn already computes attendance_status correctly against
+          // this specific employee's own configurable shift_start, so this is
+          // a deliberate fix over the source (which ignores shift_start
+          // entirely for this particular gate), not a faithful port.
+          if (record.attendance_status === 'Late') {
+            const resolvedRows = await resolveTier(tenant.id, 'late_reason', null, employee.role);
+            if (resolvedRows.length > 0) {
+              await setConvState(tenant.id, from, {
+                step: 'awaiting_late_reason',
+                data: { checkinTime: record.check_in_time, lateMinutes: record.late_minutes },
+              });
+              await whatsapp.sendText(tenant, from, '📝 You checked in late. Please type the *reason* for your late check-in:');
+              return;
+            }
+            // no configured late_reason chain for this employee's role — skip
+            // silently, same as the source's behavior when getLateReasonManager
+            // resolves nothing.
+          }
+        } else {
+          const record = await updateCheckOut(tenant.id, employee.id, lat, lng);
+          await deleteConvState(tenant.id, from);
+          if (!record) {
+            await whatsapp.sendText(tenant, from, '⚠️ No check-in found for today. Please check in first.');
+            return;
+          }
+          await whatsapp.sendText(
+            tenant,
+            from,
+            `✅ *Checked Out*\n\nCheck-In: ${record.check_in_time}\nCheck-Out: ${record.check_out_time}`
+          );
+        }
       } else {
         await whatsapp.sendText(tenant, from, "I wasn't expecting a location right now. Type 'check in' or 'check out' first.");
       }
@@ -125,12 +179,50 @@ router.post('/', async (req, res) => {
     if (message.type === 'text') {
       const text = message.text.body.trim().toLowerCase();
 
+      const lateReasonState = await getConvState(tenant.id, from);
+      if (lateReasonState && lateReasonState.step === 'awaiting_late_reason') {
+        const employee = await getEmployeeByPhone(tenant.id, from);
+        if (!employee) {
+          await deleteConvState(tenant.id, from);
+          await whatsapp.sendText(tenant, from, "We couldn't find your employee record. Please contact your admin.");
+          return;
+        }
+        const reason = message.text.body.trim();
+        await deleteConvState(tenant.id, from);
+        const sendInfoFn = (contact, msgText) => whatsapp.sendText(tenant, contact, msgText);
+        await broadcastNotifyOnly(
+          tenant.id,
+          'late_reason',
+          employee,
+          employee.role,
+          sendInfoFn,
+          () => getLateReasonSummary(tenant.id, 'late_reason', {
+            employeeName: employee.full_name,
+            checkinTime: lateReasonState.data.checkinTime,
+            lateMinutes: lateReasonState.data.lateMinutes,
+            reason,
+          })
+        );
+        await whatsapp.sendText(tenant, from, '✅ Reason recorded. Thank you for reporting.');
+        return;
+      }
+
       if (tenant.features.attendance && ['check in', 'checkin', 'check-in'].includes(text)) {
+        const employee = await getEmployeeByPhone(tenant.id, from);
+        if (!employee) {
+          await whatsapp.sendText(tenant, from, "We couldn't find your employee record. Please contact your administrator.");
+          return;
+        }
         await setConvState(tenant.id, from, { step: 'awaiting_location', data: { type: 'in' } });
         await whatsapp.requestLocation(tenant, from, '📍 Please share your location to confirm check-in.');
         return;
       }
       if (tenant.features.attendance && ['check out', 'checkout', 'check-out'].includes(text)) {
+        const employee = await getEmployeeByPhone(tenant.id, from);
+        if (!employee) {
+          await whatsapp.sendText(tenant, from, "We couldn't find your employee record. Please contact your administrator.");
+          return;
+        }
         await setConvState(tenant.id, from, { step: 'awaiting_location', data: { type: 'out' } });
         await whatsapp.requestLocation(tenant, from, '📍 Please share your location to confirm check-out.');
         return;
@@ -147,6 +239,41 @@ router.post('/', async (req, res) => {
         from,
         `👋 Hi! I'm the ${tenant.name} Bot.\n\nEmployees: type 'check in' or 'check out'.\nFor anything else, please contact your administrator.`
       );
+      return;
+    }
+
+    // ── 3. Button/interactive replies — approve/reject on a pending request ──
+    // Two real Meta payload shapes, matching kapa-attendance-bot's
+    // handleButtonReply for consistency: the reply-buttons format we
+    // actually send via whatsapp.sendButtons comes back as
+    // type:"interactive" / interactive.type:"button_reply", with the id
+    // at message.interactive.button_reply.id. type:"button" /
+    // message.button.payload is the older template-button shape — kept
+    // for parity with source even though nothing we send uses it today.
+    let buttonId = null;
+    if (message.type === 'interactive' && message.interactive?.type === 'button_reply') {
+      buttonId = message.interactive.button_reply.id;
+    } else if (message.type === 'button') {
+      buttonId = message.button?.payload || null;
+    }
+
+    if (buttonId) {
+      // leave/expense/task_completion wired so far — overtime/quotation/
+      // payroll_adjustment fall through to the generic reply below until
+      // their handlers exist.
+      if (/^(approve|reject)_leave_/.test(buttonId)) {
+        const result = await handleLeaveApprovalReply(tenant, buttonId, from);
+        await whatsapp.sendText(tenant, from, result.message);
+      } else if (/^(approve|reject)_expense_/.test(buttonId)) {
+        const result = await handleExpenseApprovalReply(tenant, buttonId, from);
+        await whatsapp.sendText(tenant, from, result.message);
+      } else if (/^(approve|reject)_task_completion_/.test(buttonId)) {
+        const result = await handleTaskCompletionApprovalReply(tenant, buttonId, from);
+        await whatsapp.sendText(tenant, from, result.message);
+      } else {
+        await whatsapp.sendText(tenant, from, "This type of approval isn't supported yet. Please contact your administrator.");
+      }
+      return;
     }
   } catch (err) {
     logger.error('Error handling incoming webhook message:', err);
