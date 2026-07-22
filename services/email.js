@@ -10,7 +10,14 @@ const logger = require('../utils/logger');
 // welcome email is a first-touch message where a reply is genuinely
 // welcome, not a pure notification.
 const FROM_ADDRESS = 'KAPA Technologies <hello@kapa.my>';
-const SUPPORT_WHATSAPP = '+60 12-207 0521';
+// Two distinct numbers, two distinct purposes — DEMO_WHATSAPP is the
+// actual working bot (the main CTA: message it to start using the
+// trial); SUPPORT_WHATSAPP is a human on the sales/support side, for
+// questions rather than product use. Conflating these into one number
+// (as the previous version did) would send trial users asking a
+// question straight into the bot instead of a person.
+const DEMO_WHATSAPP = '+60 12-207 0521';
+const SUPPORT_WHATSAPP = '+91 75500 08031';
 
 let resendClient = null;
 
@@ -46,9 +53,10 @@ async function sendWelcomeEmail(to, data) {
     <div style="font-family: -apple-system, sans-serif; max-width: 480px; margin: 0 auto; color: #202124;">
       <p>Hi ${data.contactName},</p>
       <p>Your 7-day trial of <strong>KAPA ONE ${data.industryName}</strong> for <strong>${data.companyName}</strong> is ready to go.</p>
-      <p>Message <strong>${SUPPORT_WHATSAPP}</strong> on WhatsApp and type <strong>"check in"</strong> to start using it right now.</p>
+      <p>Message <strong>${DEMO_WHATSAPP}</strong> on WhatsApp to start using your ${data.industryName} trial right now.</p>
       <p>Your trial ends on <strong>${trialEndsDate}</strong>.</p>
       <p>Thanks for trying KAPA ONE.<br>— The KAPA Technologies Team</p>
+      <p style="font-size: 13px; color: #5f6368; margin-top: 24px;">Questions? Reach our team at ${SUPPORT_WHATSAPP}.</p>
     </div>
   `;
 
