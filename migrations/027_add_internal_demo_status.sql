@@ -1,0 +1,35 @@
+-- Adds 'internal_demo' as a valid bot_trial_signups.status value,
+-- alongside the existing 'trial'/'upgraded'/'expired' — for tenants
+-- created for internal use (sales demos, testing, showcases) rather
+-- than a real prospect's trial, so they can eventually be distinguished
+-- from genuine trial signups (e.g. filtered out of admin conversion
+-- reporting) without being conflated with 'trial' status.
+--
+-- bot_companies (the legacy, pre-migration-006 tenant table — see
+-- migration 023's header comment for the full bot_companies vs.
+-- bot_tenants history) is NOT touched here. It has its own, differently
+-- named `plan enum('trial','paid')` column, not a `status` column, and
+-- nothing has written to bot_companies since migration 006 —
+-- createTrialSignup (services/db-mysql.js) only ever inserts into
+-- bot_tenants + bot_trial_signups + bot_employees. Adding a value there
+-- would be schema-only noise with no code path that could ever set or
+-- read it for a new tenant.
+--
+-- Scope note: this migration only widens the ENUM. It does NOT add any
+-- code path that sets a tenant's status to 'internal_demo', nor any
+-- special-case handling for it in tenantResolution.js (which today only
+-- branches on status === 'expired' — an 'internal_demo' tenant would
+-- otherwise resolve and behave exactly like an ordinary active trial).
+-- Wiring up creation and any resolution-time handling is separate,
+-- follow-up work, not part of this schema change.
+--
+-- MySQL allows widening an ENUM in place without a table rebuild when
+-- only appending a new value (existing rows/positions are unaffected) —
+-- confirmed safe against current data: no existing bot_trial_signups
+-- row uses this value (it doesn't exist yet), so there's nothing to
+-- migrate or backfill.
+--
+-- NOT executed yet — review before running against Railway.
+
+ALTER TABLE bot_trial_signups
+  MODIFY COLUMN status ENUM('trial','upgraded','expired','internal_demo') DEFAULT 'trial';

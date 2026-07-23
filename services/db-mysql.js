@@ -380,6 +380,24 @@ async function getMonthAttendance(tenantId, employeeId, year, month) {
 }
 
 /**
+ * Tenant-wide, not scoped to one employee — unlike getTodayAttendance/
+ * getMonthAttendance (both per-employee), this is for a dashboard
+ * overview across every employee at once. Ordered most-recent-first;
+ * limit defaults to 50 rather than returning the tenant's entire
+ * attendance history unbounded.
+ */
+async function getRecentAttendanceForTenant(tenantId, limit = 50) {
+  const [rows] = await pool.query(
+    `SELECT * FROM bot_employee_attendance
+     WHERE tenant_id = ?
+     ORDER BY attendance_date DESC, created_at DESC
+     LIMIT ?`,
+    [tenantId, limit]
+  );
+  return rows.map(formatAttendanceRow);
+}
+
+/**
  * Rolls up one employee's attendance for a single month into summary
  * stats. Reuses getMonthAttendance for the raw rows and
  * getWorkingDaysInMonth (defined further below in this file — safe to
@@ -540,6 +558,30 @@ async function getLeaveRequestSummary(tenantId, requestType, recordId) {
   if (!rows.length) return 'Leave request details unavailable.';
   const leave = rows[0];
   return `📋 Leave Request\n\n👤 ${leave.employee_name || 'Employee'}\n📅 ${leave.start_date_fmt} to ${leave.end_date_fmt} (${leave.total_days} day(s))\n🏷️ ${leave.leave_type}\n📝 ${leave.reason || '-'}`;
+}
+
+/**
+ * Tenant-wide leave request listing for a dashboard overview — every
+ * employee at once, most-recent-first, bounded by limit. start_date/
+ * end_date are DATE_FORMATted in SQL rather than left as mysql2's raw
+ * Date objects, same reasoning as getLeaveRequestSummary just above:
+ * serializing a raw Date (e.g. via JSON.stringify in an API response)
+ * re-introduces the UTC-offset date-shifting bug already found and
+ * fixed elsewhere this session.
+ */
+async function getRecentLeaveRequestsForTenant(tenantId, limit = 50) {
+  const [rows] = await pool.query(
+    `SELECT id, employee_id, employee_name, whatsapp_number, leave_type,
+            DATE_FORMAT(start_date, '%Y-%m-%d') AS start_date,
+            DATE_FORMAT(end_date, '%Y-%m-%d') AS end_date,
+            total_days, reason, approval_status, approved_by, approved_at, created_at
+     FROM bot_leave_requests
+     WHERE tenant_id = ?
+     ORDER BY created_at DESC
+     LIMIT ?`,
+    [tenantId, limit]
+  );
+  return rows;
 }
 
 /**
@@ -1439,6 +1481,26 @@ async function getOwnerEmployee(tenantId) {
   return rows[0] || null;
 }
 
+/**
+ * Full staff directory for a tenant, for a dashboard listing —
+ * password_hash is excluded at the SQL level (explicit column list, not
+ * a fetch-then-delete-the-field pattern), so it never exists in this
+ * function's result at all rather than relying on every caller to
+ * remember to strip it before it reaches an HTTP response.
+ */
+async function getEmployeesForTenant(tenantId) {
+  const [rows] = await pool.query(
+    `SELECT id, tenant_id, employee_code, full_name, whatsapp_number, role, title,
+            department, reports_to_employee_id, shift_start, salary, fixed_allowance,
+            geofence_exempt, is_active, created_at, updated_at
+     FROM bot_employees
+     WHERE tenant_id = ?
+     ORDER BY role, full_name`,
+    [tenantId]
+  );
+  return rows;
+}
+
 async function updateDocumentReminderSentAt(tenantId, documentId) {
   const [result] = await pool.execute(
     'UPDATE bot_foreign_worker_documents SET reminder_sent_at = NOW() WHERE id = ? AND tenant_id = ?',
@@ -1496,4 +1558,7 @@ module.exports = {
   getExpiringDocuments,
   getOwnerEmployee,
   updateDocumentReminderSentAt,
+  getRecentAttendanceForTenant,
+  getRecentLeaveRequestsForTenant,
+  getEmployeesForTenant,
 };

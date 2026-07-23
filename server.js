@@ -14,6 +14,7 @@ const subscriptionsRoutes = require('./routes/subscriptions');
 const productsRoutes = require('./routes/products');
 const trialSignupRoutes = require('./routes/trialSignup');
 const adminSignupsRoutes = require('./routes/adminSignups');
+const hubRoutes = require('./routes/hub');
 
 const app = express();
 
@@ -89,6 +90,7 @@ app.use('/api/exchange-rates', productsRoutes.exchangeRatesRouter);
 // ── Trial signup — public, no api-key/tenant yet (that's the whole
 //    point: this is what CREATES a tenant) ──────────────────────────────
 app.use('/api/trial-signup', trialSignupRoutes);
+app.use('/api/hub', hubRoutes);
 
 // ── Trial signup admin view — every route in this file is admin-only ───
 app.use('/api/admin/trial-signups', requireAdmin, adminSignupsRoutes);
