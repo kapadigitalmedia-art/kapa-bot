@@ -40,7 +40,9 @@ const app = express();
 // Access-Control-Request-Headers: x-admin-key — omitting it here would
 // have left the origin-array fix still incomplete for that specific
 // caller.
-const ALLOWED_ORIGINS = ['https://www.kapa.my', 'https://admin.kapa.my'];
+// TEMP - http://localhost:8080 added for local kapa-hub.html testing,
+// remove before final deploy once testing is done.
+const ALLOWED_ORIGINS = ['https://www.kapa.my', 'https://admin.kapa.my', 'http://localhost:8080'];
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (ALLOWED_ORIGINS.includes(origin)) {
