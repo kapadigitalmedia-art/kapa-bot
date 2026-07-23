@@ -1132,16 +1132,17 @@ async function getIndustryForTenant(tenantId) {
  * Creates a trial signup's bot_tenants row FIRST, then its
  * bot_trial_signups row referencing it, then a bot_employees row for the
  * signer themselves (role='owner') so they can immediately check in/
- * apply leave/etc. in their own tenant — three inserts, not wrapped in a
- * real transaction (no transaction wrapper exists anywhere else in this
- * codebase either, e.g. createTask's task+assignments inserts have the
- * exact same gap). KNOWN GAP: if a later insert fails after an earlier
- * one succeeds, the earlier row(s) are left committed with nothing
- * referencing them yet — inert, not actively harmful (nothing resolves
- * to an orphaned tenant_id/signup without its dependent row), but would
- * need manual cleanup/retry if it ever happens. Not over-engineering a
- * rollback for one function when the rest of the codebase doesn't have
- * one either.
+ * apply leave/etc. in their own tenant, then a default bot_approval_chains
+ * row routing 'leave' requests straight to that same owner — four
+ * inserts, not wrapped in a real transaction (no transaction wrapper
+ * exists anywhere else in this codebase either, e.g. createTask's
+ * task+assignments inserts have the exact same gap). KNOWN GAP: if a
+ * later insert fails after an earlier one succeeds, the earlier row(s)
+ * are left committed with nothing referencing them yet — inert, not
+ * actively harmful (nothing resolves to an orphaned tenant_id/signup
+ * without its dependent row), but would need manual cleanup/retry if it
+ * ever happens. Not over-engineering a rollback for one function when
+ * the rest of the codebase doesn't have one either.
  */
 async function createTrialSignup(data) {
   const tenantId = `trial_${crypto.randomUUID()}`;
@@ -1207,6 +1208,35 @@ async function createTrialSignup(data) {
   // transaction wrapper exists anywhere in this codebase to roll all
   // three back together.
   if (employeeId === null || employeeId === undefined) {
+    return null;
+  }
+
+  // Default approval chain for 'leave' requests, routing straight to the
+  // owner employee just created above — without this, a brand-new trial
+  // tenant has zero bot_approval_chains rows at all, and resolveTier
+  // (services/db-mysql.js) returns [] for every leave request, meaning
+  // startApprovalFlow (services/approvalEngine.js) silently does nothing:
+  // the leave request row gets created fine but nobody is ever notified
+  // to approve it. applies_to_subtype/applies_to_role are both '*'
+  // (matches any subtype/role) so this one row covers every employee's
+  // leave requests in this tenant until they configure something more
+  // specific themselves.
+  const [chainResult] = await pool.execute(
+    `INSERT INTO bot_approval_chains
+       (tenant_id, request_type, applies_to_subtype, applies_to_role, step_order, approver_type, approver_employee_id, cc_only)
+     VALUES (?, 'leave', '*', '*', 1, 'employee', ?, FALSE)`,
+    [tenantId, employeeId]
+  );
+  const chainId = chainResult.insertId;
+
+  // Same defensive check as the three inserts above. KNOWN GAP (same
+  // class as before, still not solved here): a failure on this fourth
+  // insert leaves the tenant/signup/owner rows already committed and
+  // fully functional for everything EXCEPT leave approvals — check-in,
+  // expenses, tasks etc. are unaffected, only leave requests would go
+  // unrouted (same silent-no-op behavior as any tenant that never got a
+  // chain seeded at all, not a regression from having tried).
+  if (chainId === null || chainId === undefined) {
     return null;
   }
 
