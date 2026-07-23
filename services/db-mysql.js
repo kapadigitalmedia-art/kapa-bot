@@ -380,6 +380,67 @@ async function getMonthAttendance(tenantId, employeeId, year, month) {
 }
 
 /**
+ * Rolls up one employee's attendance for a single month into summary
+ * stats. Reuses getMonthAttendance for the raw rows and
+ * getWorkingDaysInMonth (defined further below in this file — safe to
+ * call here regardless of declaration order, since `function`
+ * declarations are hoisted module-wide) for the denominator, rather than
+ * recomputing either.
+ *
+ * "Present" is judged the same way calculatePayroll already does
+ * (attendance_status is 'Present' or 'Late' — both mean the employee
+ * showed up, just not always on time), not merely "row exists for this
+ * date", so the definition stays consistent with the one other place in
+ * this file that already answers "was this employee present" from this
+ * table.
+ *
+ * attendance_rate is present_days / working_days_in_month, rounded to 1
+ * decimal and expressed as a 0-100 percentage (e.g. 83.3), since this is
+ * a human-facing summary, not a raw fraction. average_late_minutes is 0
+ * (not NaN) when the employee was never late, rather than dividing by a
+ * zero total_days_late.
+ */
+async function getEmployeePerformanceSummary(tenantId, employeeId, month, year) {
+  const attendances = await getMonthAttendance(tenantId, employeeId, year, month);
+
+  let totalDaysPresent = 0;
+  let totalDaysLate = 0;
+  let totalLateMinutes = 0;
+
+  for (const att of attendances) {
+    const status = String(att.attendance_status || '').toLowerCase();
+    if (['present', 'late'].includes(status)) totalDaysPresent++;
+
+    const lateMin = parseFloat(att.late_minutes || 0);
+    if (lateMin > 0) {
+      totalDaysLate++;
+      totalLateMinutes += lateMin;
+    }
+  }
+
+  const workingDays = getWorkingDaysInMonth(month, year);
+  const averageLateMinutes = totalDaysLate > 0
+    ? Math.round((totalLateMinutes / totalDaysLate) * 10) / 10
+    : 0;
+  const attendanceRate = workingDays > 0
+    ? Math.round((totalDaysPresent / workingDays) * 1000) / 10
+    : 0;
+
+  return {
+    tenant_id: tenantId,
+    employee_id: employeeId,
+    month,
+    year,
+    total_days_present: totalDaysPresent,
+    total_days_late: totalDaysLate,
+    total_late_minutes: totalLateMinutes,
+    average_late_minutes: averageLateMinutes,
+    working_days: workingDays,
+    attendance_rate: attendanceRate,
+  };
+}
+
+/**
  * Leave requests (bot_leave_requests) — plain async functions, same
  * precedent as attendance above. Deliberately does NOT compute
  * first_approver here (the source's getLeaveFirstApprover per-employee
@@ -1254,6 +1315,7 @@ module.exports = {
   updateCheckOut,
   getTodayAttendance,
   getMonthAttendance,
+  getEmployeePerformanceSummary,
   createLeaveRequest,
   updateLeaveStatus,
   isEmployeeOnLeave,
