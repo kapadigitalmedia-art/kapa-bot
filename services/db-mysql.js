@@ -385,10 +385,25 @@ async function getMonthAttendance(tenantId, employeeId, year, month) {
  * overview across every employee at once. Ordered most-recent-first;
  * limit defaults to 50 rather than returning the tenant's entire
  * attendance history unbounded.
+ *
+ * attendance_date is explicitly DATE_FORMATted rather than left as a
+ * raw DATE column (unlike getTodayAttendance/getMonthAttendance, which
+ * never leave this file's own boundary, this function's result is
+ * serialized straight into an HTTP response by routes/hub.js) — same
+ * pool-timezone JSON-serialization bug already found and fixed for
+ * bot_foreign_worker_documents just above; a raw DATE column would
+ * silently roll back a day once JSON.stringify calls toISOString() on
+ * it.
  */
 async function getRecentAttendanceForTenant(tenantId, limit = 50) {
   const [rows] = await pool.query(
-    `SELECT * FROM bot_employee_attendance
+    `SELECT id, tenant_id, employee_id, employee_name, whatsapp_number,
+            DATE_FORMAT(attendance_date, '%Y-%m-%d') AS attendance_date,
+            check_in_time, check_out_time, check_in_latitude, check_in_longitude,
+            check_out_latitude, check_out_longitude, attendance_status, late_minutes,
+            checkin_attempt_time, checkin_attempt_lat, checkin_attempt_lng,
+            checkin_fail_reason, remark, ot_minutes, ot_type, created_at, updated_at
+     FROM bot_employee_attendance
      WHERE tenant_id = ?
      ORDER BY attendance_date DESC, created_at DESC
      LIMIT ?`,
@@ -1405,7 +1420,23 @@ async function getLowStockItems(tenantId) {
  * stored, never-updated status column is a live example in this same
  * codebase of exactly the staleness this avoids). Both read functions
  * compute it inline via the same CASE expression, at query time, so it
- * can never drift from expiry_date.
+ * can never drift from expiry_date. The CASE conditions compare the
+ * raw table column (unaffected by anything below), not the
+ * DATE_FORMATted alias of the same name — a SELECT list alias can't be
+ * referenced by another expression in that same SELECT list, only in
+ * ORDER BY/HAVING, so this is safe, not coincidental.
+ *
+ * issue_date/expiry_date are explicitly DATE_FORMATted rather than
+ * left as SELECT *'s raw DATE columns — mysql2 constructs those as JS
+ * Date objects per this pool's `timezone: '+08:00'` config, and
+ * res.json() serializes a Date via toISOString(), which silently rolls
+ * the calendar date back by a day on this codebase's connection
+ * (confirmed via a controlled test: MySQL DATE '2026-07-23' comes back
+ * as a JS Date whose OWN local AND UTC getters both read 2026-07-22).
+ * This is the same class of bug already found and fixed in
+ * utils/dateFormat.js/services/foreignWorkerReminders.js, just at a
+ * different call site — DATE_FORMAT sidesteps it at the source instead
+ * of requiring every caller to know to re-derive it.
  */
 async function createForeignWorkerDocument(tenantId, employeeId, employeeName, documentType, documentNumber, issueDate, expiryDate) {
   const [result] = await pool.execute(
@@ -1428,7 +1459,10 @@ async function createForeignWorkerDocument(tenantId, employeeId, employeeName, d
 
 async function getForeignWorkerDocuments(tenantId, employeeId) {
   const [rows] = await pool.query(
-    `SELECT *,
+    `SELECT id, tenant_id, employee_id, employee_name, document_type, document_number,
+            DATE_FORMAT(issue_date, '%Y-%m-%d') AS issue_date,
+            DATE_FORMAT(expiry_date, '%Y-%m-%d') AS expiry_date,
+            document_url, reminder_sent_at, created_at, updated_at,
        CASE
          WHEN expiry_date < CURDATE() THEN 'expired'
          WHEN expiry_date <= DATE_ADD(CURDATE(), INTERVAL 30 DAY) THEN 'expiring_soon'
@@ -1452,7 +1486,10 @@ async function getForeignWorkerDocuments(tenantId, employeeId) {
  */
 async function getExpiringDocuments(tenantId, daysAhead) {
   const [rows] = await pool.query(
-    `SELECT *,
+    `SELECT id, tenant_id, employee_id, employee_name, document_type, document_number,
+            DATE_FORMAT(issue_date, '%Y-%m-%d') AS issue_date,
+            DATE_FORMAT(expiry_date, '%Y-%m-%d') AS expiry_date,
+            document_url, reminder_sent_at, created_at, updated_at,
        CASE
          WHEN expiry_date < CURDATE() THEN 'expired'
          WHEN expiry_date <= DATE_ADD(CURDATE(), INTERVAL 30 DAY) THEN 'expiring_soon'
