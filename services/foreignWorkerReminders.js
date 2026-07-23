@@ -12,27 +12,35 @@
 // leaveApproval.js) — called as (contact, messageText).
 
 const { getExpiringDocuments, getOwnerEmployee, getEmployeeById, updateDocumentReminderSentAt } = require('./db-mysql');
+const { formatDateLocal } = require('../utils/dateFormat');
 
 const REMINDER_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000;
 
-function formatDate(expiryDate) {
-  // mysql2 returns DATE columns as JS Date objects — normalize to
-  // YYYY-MM-DD regardless of whether the driver ever hands back a plain
-  // string instead (defensive, not because that's been observed here).
-  const d = expiryDate instanceof Date ? expiryDate : new Date(expiryDate);
-  return d.toISOString().split('T')[0];
-}
-
+/**
+ * Same +08:00 correction as formatDateLocal (utils/dateFormat.js) —
+ * services/db-mysql.js's pool declares timezone: '+08:00', so
+ * expiryDate must be shifted back into real calendar-day terms before
+ * any math runs on it, not read via system-local getters (those read
+ * components in whatever timezone THIS process happens to run in,
+ * which was the exact bug already found and fixed in formatDateLocal).
+ * "today" is computed the same way (shifted, then re-based to UTC
+ * day-boundaries) so both sides of the subtraction are expressed in
+ * the same +08:00 business-day frame — comparing one side corrected
+ * for +08:00 against the other read in the process's own arbitrary
+ * system timezone would just reintroduce the identical class of bug
+ * from a different angle.
+ */
 function daysRemaining(expiryDate) {
   const d = expiryDate instanceof Date ? expiryDate : new Date(expiryDate);
   const msPerDay = 1000 * 60 * 60 * 24;
-  // Both sides floored to midnight before differencing — otherwise the
-  // current time-of-day (e.g. checking at 11pm vs 1am) shifts the result
-  // by a day even though the calendar-day gap hasn't changed.
-  const today = new Date();
-  const todayMidnight = new Date(today.getFullYear(), today.getMonth(), today.getDate());
-  const expiryMidnight = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-  return Math.round((expiryMidnight - todayMidnight) / msPerDay);
+
+  const expiryShifted = new Date(d.getTime() + 8 * 60 * 60 * 1000);
+  const expiryDayUTC = Date.UTC(expiryShifted.getUTCFullYear(), expiryShifted.getUTCMonth(), expiryShifted.getUTCDate());
+
+  const nowShifted = new Date(Date.now() + 8 * 60 * 60 * 1000);
+  const todayDayUTC = Date.UTC(nowShifted.getUTCFullYear(), nowShifted.getUTCMonth(), nowShifted.getUTCDate());
+
+  return Math.round((expiryDayUTC - todayDayUTC) / msPerDay);
 }
 
 /**
@@ -56,7 +64,7 @@ async function checkAndSendExpiryReminders(tenant, sendInfoFn) {
       if (Date.now() - lastSent < REMINDER_COOLDOWN_MS) continue;
     }
 
-    const message = `⚠️ Document Expiry Alert\n\n${doc.employee_name}'s ${doc.document_type} expires on ${formatDate(doc.expiry_date)} (${daysRemaining(doc.expiry_date)} days remaining).\nPlease renew soon.`;
+    const message = `⚠️ Document Expiry Alert\n\n${doc.employee_name}'s ${doc.document_type} expires on ${formatDateLocal(doc.expiry_date)} (${daysRemaining(doc.expiry_date)} days remaining).\nPlease renew soon.`;
 
     const owner = await getOwnerEmployee(tenant.id);
     if (owner && owner.whatsapp_number) {

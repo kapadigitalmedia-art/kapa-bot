@@ -13,8 +13,11 @@ const {
   updateCheckOut,
   resolveTier,
   getIndustryForTenant,
+  getLowStockItems,
+  getExpiringDocuments,
 } = require('../services/db-mysql');
 const logger = require('../utils/logger');
+const { formatDateLocal } = require('../utils/dateFormat');
 const { handleAdminCommand } = require('../services/adminCommands');
 const { handleLeaveApprovalReply } = require('../services/leaveApproval');
 const { handleExpenseApprovalReply } = require('../services/expenseApproval');
@@ -22,6 +25,7 @@ const { handleTaskCompletionApprovalReply } = require('../services/taskCompletio
 const { broadcastNotifyOnly } = require('../services/approvalEngine');
 const { getLateReasonSummary } = require('../services/lateReason');
 const { sendIndustryPicker, handleIndustrySelection, simulateDemoCheckIn, simulateDemoCheckOut } = require('../services/prospectDemo');
+const { sendDineMenu } = require('../services/dineMenu');
 
 /**
  * conversationState is live, mid-conversation state for a real person
@@ -261,6 +265,19 @@ router.post('/', async (req, res) => {
           return;
         }
 
+        // Looked up once here and reused below by both the 'menu'
+        // keyword check and the industry-specific greeting fallback —
+        // only 'dine' has either today; every other industry (including
+        // 'kapa' itself, which has no bot_trial_signups row at all)
+        // leaves industrySlug null and both branches below are simply
+        // never reached, same as before this was added.
+        const industrySlug = await getIndustryForTenant(tenant.id);
+
+        if (industrySlug === 'dine' && text === 'menu') {
+          await sendDineMenu(tenant, from, employee);
+          return;
+        }
+
         if (tenant.features.attendance && ['check in', 'checkin', 'check-in'].includes(text)) {
           await setConvState(tenant.id, from, { step: 'awaiting_location', data: { type: 'in' } });
           await whatsapp.requestLocation(tenant, from, '📍 Please share your location to confirm check-in.');
@@ -282,7 +299,6 @@ router.post('/', async (req, res) => {
         // every other industry (including 'kapa' itself, which has no
         // bot_trial_signups row at all) falls through to the existing
         // generic greeting completely unchanged.
-        const industrySlug = await getIndustryForTenant(tenant.id);
         if (industrySlug === 'dine') {
           await whatsapp.sendText(
             tenant,
@@ -325,10 +341,53 @@ router.post('/', async (req, res) => {
       return;
     }
 
-    // ── 3. List replies — prospect industry picker ────────────────────────
+    // ── 3. List replies — Dine menu selections, or prospect industry picker ──
     if (message.type === 'interactive' && message.interactive?.type === 'list_reply') {
-      const industryId = message.interactive.list_reply.id;
-      const result = handleIndustrySelection(industryId);
+      const listId = message.interactive.list_reply.id;
+
+      // Only a resolved employee (real bot_employees row) could ever have
+      // been sent sendDineMenu's list in the first place — a prospect
+      // only ever sees the industry picker's 9 rows, which never collide
+      // with these ids. Checked here (not gated on industrySlug === 'dine'
+      // again) because by this point all that matters is "did this ID
+      // come from our own Dine menu", not which industry the tenant is.
+      const DINE_MENU_IDS = ['dashboard', 'inventory', 'staff', 'leave', 'foreign_worker_docs', 'checkin', 'my_records'];
+      if (DINE_MENU_IDS.includes(listId)) {
+        const employee = await getEmployeeByPhone(tenant.id, from);
+        if (employee) {
+          let reply;
+          if (listId === 'inventory') {
+            const lowStock = await getLowStockItems(tenant.id);
+            reply = lowStock.length
+              ? '📦 *Low Stock Alert*\n\n' + lowStock.map((item) =>
+                  `• ${item.item_name}: ${item.current_stock}${item.unit ? ' ' + item.unit : ''} (min: ${item.minimum_stock}${item.unit ? ' ' + item.unit : ''})`
+                ).join('\n')
+              : '✅ All stock levels are healthy!';
+          } else if (listId === 'foreign_worker_docs') {
+            const expiring = await getExpiringDocuments(tenant.id, 30);
+            reply = expiring.length
+              ? '📄 *Expiring Documents*\n\n' + expiring.map((doc) => {
+                  const expiryStr = formatDateLocal(doc.expiry_date);
+                  const label = doc.status === 'expired' ? 'EXPIRED' : 'expiring soon';
+                  return `• ${doc.employee_name} — ${doc.document_type} expires ${expiryStr} (${label})`;
+                }).join('\n')
+              : '✅ No documents expiring in the next 30 days!';
+          } else if (listId === 'checkin') {
+            reply = "Type 'check in' or 'check out' to use this directly.";
+          } else {
+            // dashboard/staff/leave/my_records — none of these have a
+            // real WhatsApp-native flow yet (leave DOES work
+            // end-to-end via createLeaveRequestWithApproval, but nothing
+            // in this text handler exposes it as a typed command today),
+            // so this is an honest placeholder, not a fake success reply.
+            reply = '📊 View this in your Kapa Hub dashboard: [link]';
+          }
+          await whatsapp.sendText(tenant, from, reply);
+          return;
+        }
+      }
+
+      const result = handleIndustrySelection(listId);
       if (result) {
         if (result.newConvState) {
           await setConvState(tenant.id, from, result.newConvState);
