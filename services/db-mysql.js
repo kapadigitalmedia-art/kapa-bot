@@ -1356,6 +1356,76 @@ async function getLowStockItems(tenantId) {
   return rows;
 }
 
+/**
+ * Foreign worker documents (bot_foreign_worker_documents, migration
+ * 026) — status is deliberately NOT a stored column (see that
+ * migration's header comment for the full reasoning: bot_trial_signups'
+ * stored, never-updated status column is a live example in this same
+ * codebase of exactly the staleness this avoids). Both read functions
+ * compute it inline via the same CASE expression, at query time, so it
+ * can never drift from expiry_date.
+ */
+async function createForeignWorkerDocument(tenantId, employeeId, employeeName, documentType, documentNumber, issueDate, expiryDate) {
+  const [result] = await pool.execute(
+    `INSERT INTO bot_foreign_worker_documents
+       (tenant_id, employee_id, employee_name, document_type, document_number, issue_date, expiry_date)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [tenantId, employeeId, employeeName ?? null, documentType, documentNumber ?? null, issueDate ?? null, expiryDate]
+  );
+  const insertId = result.insertId;
+
+  // Same defensive check applied to every other create* function in
+  // this file — a truthy-but-invalid insertId (e.g. 0) would otherwise
+  // report success for a row that was never actually written.
+  if (insertId === null || insertId === undefined) {
+    return null;
+  }
+
+  return { id: insertId };
+}
+
+async function getForeignWorkerDocuments(tenantId, employeeId) {
+  const [rows] = await pool.query(
+    `SELECT *,
+       CASE
+         WHEN expiry_date < CURDATE() THEN 'expired'
+         WHEN expiry_date <= DATE_ADD(CURDATE(), INTERVAL 30 DAY) THEN 'expiring_soon'
+         ELSE 'valid'
+       END AS status
+     FROM bot_foreign_worker_documents
+     WHERE tenant_id = ? AND employee_id = ?
+     ORDER BY document_type`,
+    [tenantId, employeeId]
+  );
+  return rows;
+}
+
+/**
+ * Tenant-wide, not scoped to one employee — this is what the daily
+ * reminder cron queries to decide who needs a notification today.
+ * expiry_date >= CURDATE() excludes already-expired documents (those
+ * need a different, presumably more urgent handling path than a
+ * routine "expiring soon" reminder, and re-reminding about something
+ * already expired every single day forever isn't useful).
+ */
+async function getExpiringDocuments(tenantId, daysAhead) {
+  const [rows] = await pool.query(
+    `SELECT *,
+       CASE
+         WHEN expiry_date < CURDATE() THEN 'expired'
+         WHEN expiry_date <= DATE_ADD(CURDATE(), INTERVAL 30 DAY) THEN 'expiring_soon'
+         ELSE 'valid'
+       END AS status
+     FROM bot_foreign_worker_documents
+     WHERE tenant_id = ?
+       AND expiry_date <= DATE_ADD(CURDATE(), INTERVAL ? DAY)
+       AND expiry_date >= CURDATE()
+     ORDER BY expiry_date`,
+    [tenantId, daysAhead]
+  );
+  return rows;
+}
+
 module.exports = {
   pool,
   tenantDb,
@@ -1400,4 +1470,7 @@ module.exports = {
   updateInventoryStock,
   getInventory,
   getLowStockItems,
+  createForeignWorkerDocument,
+  getForeignWorkerDocuments,
+  getExpiringDocuments,
 };
