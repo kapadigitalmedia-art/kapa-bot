@@ -39,7 +39,12 @@ const app = express();
 // Trial Signups tab, whose preflight sends
 // Access-Control-Request-Headers: x-admin-key — omitting it here would
 // have left the origin-array fix still incomplete for that specific
-// caller.
+// caller. Same class of gap found again for routes/hub.js: every
+// authenticated Hub data endpoint sends Authorization: Bearer <token>,
+// a non-safelisted header that also triggers a real preflight — caught
+// via a real OPTIONS request from a browser-realistic Origin before it
+// could silently block every dashboard fetch past login (login itself
+// has no Authorization header, so it alone would have looked fine).
 // TEMP - http://localhost:8080 added for local kapa-hub.html testing,
 // remove before final deploy once testing is done.
 const ALLOWED_ORIGINS = ['https://www.kapa.my', 'https://admin.kapa.my', 'http://localhost:8080'];
@@ -49,7 +54,7 @@ app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', origin);
   }
   res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, x-api-key, x-admin-key');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, x-api-key, x-admin-key, Authorization');
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
   }
