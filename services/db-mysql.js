@@ -1304,6 +1304,58 @@ async function createTrialSignup(data) {
   return { id: signupId, tenant_id: tenantId, employee_id: employeeId };
 }
 
+/**
+ * Dine inventory (bot_dine_inventory, migration 025) — adapted from
+ * kapa-dine-bot's real, working dine_inventory table, with two
+ * deliberate improvements over that source (see the migration's own
+ * header comment for the full reasoning): updateInventoryStock keys off
+ * the real `id` primary key instead of case-insensitive item_name
+ * string matching, and getLowStockItems is a genuinely new capability —
+ * the source has the minimum_stock column but never once queries
+ * current_stock against it.
+ */
+async function createInventoryItem(tenantId, itemName, category, currentStock, minimumStock, unit) {
+  const [result] = await pool.execute(
+    `INSERT INTO bot_dine_inventory (tenant_id, item_name, category, current_stock, minimum_stock, unit)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [tenantId, itemName, category ?? null, currentStock ?? 0, minimumStock ?? 0, unit ?? null]
+  );
+  const insertId = result.insertId;
+
+  // Same defensive check applied to every other create* function in
+  // this file — a truthy-but-invalid insertId (e.g. 0) would otherwise
+  // report success for a row that was never actually written.
+  if (insertId === null || insertId === undefined) {
+    return null;
+  }
+
+  return { id: insertId };
+}
+
+async function updateInventoryStock(tenantId, itemId, newStock) {
+  const [result] = await pool.execute(
+    'UPDATE bot_dine_inventory SET current_stock = ? WHERE id = ? AND tenant_id = ?',
+    [newStock, itemId, tenantId]
+  );
+  return result.affectedRows > 0;
+}
+
+async function getInventory(tenantId) {
+  const [rows] = await pool.query(
+    'SELECT * FROM bot_dine_inventory WHERE tenant_id = ? AND is_active = TRUE ORDER BY category, item_name',
+    [tenantId]
+  );
+  return rows;
+}
+
+async function getLowStockItems(tenantId) {
+  const [rows] = await pool.query(
+    'SELECT * FROM bot_dine_inventory WHERE tenant_id = ? AND is_active = TRUE AND current_stock <= minimum_stock ORDER BY item_name',
+    [tenantId]
+  );
+  return rows;
+}
+
 module.exports = {
   pool,
   tenantDb,
@@ -1344,4 +1396,8 @@ module.exports = {
   getIndustryForTenant,
   getEmployeeByPhoneAnyTenant,
   getTenantNameById,
+  createInventoryItem,
+  updateInventoryStock,
+  getInventory,
+  getLowStockItems,
 };
