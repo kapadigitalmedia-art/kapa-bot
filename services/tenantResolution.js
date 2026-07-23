@@ -36,7 +36,7 @@
 // casing needed here.
 
 const { getTenantByPhoneNumberId, SHARED_DEMO_PHONE_NUMBER_ID } = require('../config/tenants');
-const { getEmployeeByPhone, getTrialSignupByPhone } = require('./db-mysql');
+const { getEmployeeByPhone, getTrialSignupByPhone, getEmployeeByPhoneAnyTenant, getTenantNameById } = require('./db-mysql');
 
 // Asia Avid's 12 real employee numbers (pulled from the actual seeded
 // bot_employees rows under tenant_id='kapa'), blocked explicitly now
@@ -98,6 +98,27 @@ async function resolveTenantForMessage(phoneNumberId, senderWhatsappNumber) {
     const employee = await getEmployeeByPhone('kapa', senderWhatsappNumber);
     if (employee) {
       return { tenant: configTenant, configTenant };
+    }
+
+    // Covers two cases the original-signer-only trial-signup lookup below
+    // can't: (a) an employee added to a trial tenant AFTER signup (e.g. a
+    // waiter added to a Dine tenant) — they never appear in
+    // bot_trial_signups, only bot_employees; (b) a real employee of some
+    // OTHER trial tenant reusing this shared number. whatsapp_number is
+    // only unique PER-TENANT (uq_tenant_whatsapp), not globally, so more
+    // than one tenant's bot_employees can genuinely share the same number
+    // — that's a real cross-tenant collision, not a bug, and must be
+    // refused rather than silently resolved to a guessed winner.
+    const anyTenantMatches = await getEmployeeByPhoneAnyTenant(senderWhatsappNumber);
+    if (anyTenantMatches.length === 1) {
+      const match = anyTenantMatches[0];
+      const tenantName = await getTenantNameById(match.tenant_id);
+      const realTenant = { ...configTenant, id: match.tenant_id, name: tenantName || match.tenant_id };
+      return { tenant: realTenant, configTenant };
+    }
+    if (anyTenantMatches.length > 1) {
+      const matchedTenantIds = anyTenantMatches.map((m) => m.tenant_id);
+      return { tenant: null, reason: 'ambiguous_employee', configTenant, matchedTenantIds };
     }
 
     const trialSignup = await getTrialSignupByPhone(senderWhatsappNumber);

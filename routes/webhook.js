@@ -12,6 +12,7 @@ const {
   createCheckIn,
   updateCheckOut,
   resolveTier,
+  getIndustryForTenant,
 } = require('../services/db-mysql');
 const logger = require('../utils/logger');
 const { handleAdminCommand } = require('../services/adminCommands');
@@ -110,7 +111,7 @@ router.post('/', async (req, res) => {
 
     const incomingPhoneNumberId = value?.metadata?.phone_number_id;
     const from = message.from;
-    const { tenant: resolvedTenant, reason, configTenant } = await resolveTenantForMessage(incomingPhoneNumberId, from);
+    const { tenant: resolvedTenant, reason, configTenant, matchedTenantIds } = await resolveTenantForMessage(incomingPhoneNumberId, from);
 
     if (!resolvedTenant && reason === 'unknown_phone_number_id') {
       logger.warn(`Incoming message for UNKNOWN phone_number_id=${incomingPhoneNumberId} — no matching tenant in config/tenants.js. Ignoring.`);
@@ -127,6 +128,16 @@ router.post('/', async (req, res) => {
 
     if (!resolvedTenant && reason === 'trial_expired') {
       await whatsapp.sendText(configTenant, from, "⏰ Your trial has ended. Contact us to continue using KAPA ONE!\n\n👉 wa.me/917305737508");
+      return;
+    }
+
+    if (!resolvedTenant && reason === 'ambiguous_employee') {
+      // whatsapp_number collided across 2+ tenants' bot_employees (only
+      // unique per-tenant, not globally) — a real data-integrity
+      // situation, not a normal user-facing case. Silently drop rather
+      // than guess a winner or reply, since replying risks leaking one
+      // tenant's context to another tenant's employee.
+      logger.error(`Ambiguous employee match for sender=${from} on phone_number_id=${incomingPhoneNumberId} — matched multiple tenants: ${JSON.stringify(matchedTenantIds)}. Dropping message silently.`);
       return;
     }
 
@@ -264,6 +275,20 @@ router.post('/', async (req, res) => {
         if (tenant.features.adminDashboard && isAdmin) {
           const reply = await handleAdminCommand(tenant, text);
           await whatsapp.sendText(tenant, from, reply);
+          return;
+        }
+
+        // Industry-specific greeting variant — only 'dine' has one today;
+        // every other industry (including 'kapa' itself, which has no
+        // bot_trial_signups row at all) falls through to the existing
+        // generic greeting completely unchanged.
+        const industrySlug = await getIndustryForTenant(tenant.id);
+        if (industrySlug === 'dine') {
+          await whatsapp.sendText(
+            tenant,
+            from,
+            `👋 Hi! I'm your KAPA ONE Dine assistant for ${tenant.name}.\n\nStaff: type 'check in' or 'check out' to track attendance.\nMore features (menu, orders, inventory) coming soon in your dashboard!\n\nFor anything else, contact your admin.`
+          );
           return;
         }
 

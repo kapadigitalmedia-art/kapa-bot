@@ -215,6 +215,44 @@ async function getEmployeeByPhone(tenantId, whatsappNumber) {
 }
 
 /**
+ * Cross-tenant employee lookup by phone number — used to resolve a
+ * shared-number sender who is a real employee of some trial tenant
+ * OTHER than the one they originally signed up under (or an employee
+ * added to a trial tenant after the fact, who never appears in
+ * bot_trial_signups at all — that table only ever has the original
+ * signer's number). Returns EVERY match, not just one, so the caller
+ * can detect and refuse an ambiguous cross-tenant collision
+ * (whatsapp_number is only unique per-tenant, per uq_tenant_whatsapp —
+ * not globally) rather than silently picking a winner.
+ */
+async function getEmployeeByPhoneAnyTenant(whatsappNumber) {
+  const clean = String(whatsappNumber || '').replace(/[\s\+\-]/g, '');
+  const [rows] = await pool.query(
+    `SELECT * FROM bot_employees
+     WHERE is_active = TRUE
+       AND REPLACE(REPLACE(REPLACE(whatsapp_number,'+',''),'-',''),' ','') = ?`,
+    [clean]
+  );
+  return rows;
+}
+
+/**
+ * bot_tenants.tenant_name for a resolved tenant_id — needed specifically
+ * for the cross-tenant employee match above, since a bot_employees row
+ * carries no company-name field of its own (unlike the trial-signup
+ * path, which gets it from bot_trial_signups.company_name). Without
+ * this, tenant.name would fall back to the raw tenant_id UUID in the
+ * generic greeting.
+ */
+async function getTenantNameById(tenantId) {
+  const [rows] = await pool.query(
+    'SELECT tenant_name FROM bot_tenants WHERE tenant_id = ?',
+    [tenantId]
+  );
+  return rows.length ? rows[0].tenant_name : null;
+}
+
+/**
  * Attendance (bot_employee_attendance) — like conversationState above,
  * this doesn't fit the push/filter/takeRight log-collection shape either:
  * it needs upsert-by-(tenant, employee, date), a targeted UPDATE, and a
@@ -1077,6 +1115,20 @@ async function getTrialSignupByPhone(whatsappNumber) {
 }
 
 /**
+ * Looks up a trial signup's industry_slug by tenant_id — null for any
+ * tenant_id with no matching bot_trial_signups row, which includes
+ * 'kapa' itself (a real business, not a trial signup) and any future
+ * tenant type that never went through this signup path.
+ */
+async function getIndustryForTenant(tenantId) {
+  const [rows] = await pool.query(
+    'SELECT industry_slug FROM bot_trial_signups WHERE tenant_id = ?',
+    [tenantId]
+  );
+  return rows.length ? rows[0].industry_slug : null;
+}
+
+/**
  * Creates a trial signup's bot_tenants row FIRST, then its
  * bot_trial_signups row referencing it, then a bot_employees row for the
  * signer themselves (role='owner') so they can immediately check in/
@@ -1197,4 +1249,7 @@ module.exports = {
   completeApprovalProgress,
   getTrialSignupByPhone,
   createTrialSignup,
+  getIndustryForTenant,
+  getEmployeeByPhoneAnyTenant,
+  getTenantNameById,
 };
