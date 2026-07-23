@@ -1426,6 +1426,27 @@ async function getExpiringDocuments(tenantId, daysAhead) {
   return rows;
 }
 
+/**
+ * There's exactly one 'owner' row per tenant (createTrialSignup's
+ * step-3 insert) — LIMIT 1 defensively rather than assuming that never
+ * changes, but this isn't expected to ever match more than one row.
+ */
+async function getOwnerEmployee(tenantId) {
+  const [rows] = await pool.query(
+    "SELECT * FROM bot_employees WHERE tenant_id = ? AND role = 'owner' AND is_active = TRUE LIMIT 1",
+    [tenantId]
+  );
+  return rows[0] || null;
+}
+
+async function updateDocumentReminderSentAt(tenantId, documentId) {
+  const [result] = await pool.execute(
+    'UPDATE bot_foreign_worker_documents SET reminder_sent_at = NOW() WHERE id = ? AND tenant_id = ?',
+    [documentId, tenantId]
+  );
+  return result.affectedRows > 0;
+}
+
 module.exports = {
   pool,
   tenantDb,
@@ -1473,4 +1494,6 @@ module.exports = {
   createForeignWorkerDocument,
   getForeignWorkerDocuments,
   getExpiringDocuments,
+  getOwnerEmployee,
+  updateDocumentReminderSentAt,
 };
