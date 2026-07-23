@@ -15,6 +15,7 @@ const {
   getRecentAttendanceForTenant,
   getRecentLeaveRequestsForTenant,
   getEmployeesForTenant,
+  getEmployeeWithTenantName,
 } = require('../services/db-mysql');
 const logger = require('../utils/logger');
 
@@ -112,6 +113,24 @@ router.post('/login', async (req, res) => {
     return res.json({ ok: true, token });
   } catch (err) {
     logger.error('Hub login error:', err);
+    return res.status(500).json({ ok: false, error: 'Internal server error' });
+  }
+});
+
+// The frontend has no other way to learn the real business name — none
+// of the other endpoints return it (bot_employees carries only
+// tenant_id, not a name), so the sidebar/login-adjacent "who am I"
+// display was falling back to the logged-in employee's own name
+// instead of the tenant's. This is the join that fixes that.
+router.get('/me', requireHubAuth, async (req, res) => {
+  try {
+    const me = await getEmployeeWithTenantName(req.tenant_id, req.employee_id);
+    if (!me) {
+      return res.status(404).json({ ok: false, error: 'Not found' });
+    }
+    return res.json({ ok: true, full_name: me.full_name, role: me.role, tenant_name: me.tenant_name });
+  } catch (err) {
+    logger.error('Hub GET /me error:', err);
     return res.status(500).json({ ok: false, error: 'Internal server error' });
   }
 });

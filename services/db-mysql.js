@@ -1100,6 +1100,24 @@ async function getEmployeeById(tenantId, employeeId) {
   return rows[0] || null;
 }
 
+/**
+ * Joined lookup for routes/hub.js's GET /me — bot_employees carries no
+ * company/tenant-name field of its own (only tenant_id), so the real
+ * business name has to come from bot_tenants via this join, same
+ * reasoning as getTenantNameById but returning the employee's own
+ * full_name/role alongside it in one query rather than two.
+ */
+async function getEmployeeWithTenantName(tenantId, employeeId) {
+  const [rows] = await pool.query(
+    `SELECT e.full_name, e.role, t.tenant_name
+     FROM bot_employees e
+     JOIN bot_tenants t ON e.tenant_id = t.tenant_id
+     WHERE e.id = ? AND e.tenant_id = ?`,
+    [employeeId, tenantId]
+  );
+  return rows[0] || null;
+}
+
 async function getNextStepRows(tenantId, requestType, subtype, role, afterStepOrder) {
   const [rows] = await pool.query(
     `SELECT * FROM bot_approval_chains
@@ -1576,6 +1594,7 @@ module.exports = {
   resolveApprover,
   getChainRowById,
   getEmployeeById,
+  getEmployeeWithTenantName,
   getNextStepRows,
   createApprovalProgress,
   getApprovalProgress,
