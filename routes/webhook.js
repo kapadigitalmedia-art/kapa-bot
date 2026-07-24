@@ -15,11 +15,12 @@ const {
   getIndustryForTenant,
   getLowStockItems,
   getExpiringDocuments,
+  getLeaveHistoryForEmployee,
 } = require('../services/db-mysql');
 const logger = require('../utils/logger');
 const { formatDateLocal } = require('../utils/dateFormat');
 const { handleAdminCommand } = require('../services/adminCommands');
-const { handleLeaveApprovalReply } = require('../services/leaveApproval');
+const { handleLeaveApprovalReply, createLeaveRequestWithApproval } = require('../services/leaveApproval');
 const { handleExpenseApprovalReply } = require('../services/expenseApproval');
 const { handleTaskCompletionApprovalReply } = require('../services/taskCompletion');
 const { broadcastNotifyOnly } = require('../services/approvalEngine');
@@ -118,6 +119,59 @@ function formatMinutesReadable(totalMinutes) {
   const hours = Math.floor(minutes / 60);
   const remainingMinutes = minutes % 60;
   return remainingMinutes === 0 ? `${hours}h` : `${hours}h ${remainingMinutes}m`;
+}
+
+/**
+ * Accepts 'YYYY-MM-DD' or 'DD/MM/YYYY' (also 'DD-MM-YYYY', same
+ * separator-agnostic regex) for the leave-application flow's date
+ * prompts — real users type dates in either shape depending on habit,
+ * and silently accepting one but not the other would just look broken.
+ * Rejects impossible calendar dates (e.g. 31 Feb) via a round-trip
+ * check against Date.UTC — UTC specifically so this validation can
+ * never be affected by the server process's own timezone, the same
+ * class of bug already found and fixed elsewhere in this file
+ * (utils/dateFormat.js). Returns null on anything invalid, never
+ * throws — callers re-prompt rather than crash on bad input.
+ */
+function parseDateFlexible(input) {
+  const str = String(input || '').trim();
+  let y, m, d;
+  let match = str.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (match) {
+    [, y, m, d] = match;
+  } else {
+    match = str.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/);
+    if (match) {
+      [, d, m, y] = match;
+    }
+  }
+  if (!match) return null;
+
+  y = parseInt(y, 10);
+  m = parseInt(m, 10);
+  d = parseInt(d, 10);
+  if (m < 1 || m > 12 || d < 1 || d > 31) return null;
+
+  const date = new Date(Date.UTC(y, m - 1, d));
+  if (date.getUTCFullYear() !== y || date.getUTCMonth() !== m - 1 || date.getUTCDate() !== d) {
+    return null;
+  }
+
+  return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+}
+
+/**
+ * Inclusive day count between two 'YYYY-MM-DD' strings (a 1-day leave
+ * has startDate === endDate and should count as 1 day, not 0) — built
+ * from Date.UTC for the same server-timezone-independence reason as
+ * parseDateFlexible.
+ */
+function daysBetweenInclusive(startDateStr, endDateStr) {
+  const [sy, sm, sd] = startDateStr.split('-').map(Number);
+  const [ey, em, ed] = endDateStr.split('-').map(Number);
+  const start = Date.UTC(sy, sm - 1, sd);
+  const end = Date.UTC(ey, em - 1, ed);
+  return Math.round((end - start) / (1000 * 60 * 60 * 24)) + 1;
 }
 
 /**
@@ -294,8 +348,12 @@ router.post('/', async (req, res) => {
       const employee = await getEmployeeByPhone(tenant.id, from);
 
       if (employee) {
-        const lateReasonState = await getConvState(tenant.id, from);
-        if (lateReasonState && lateReasonState.step === 'awaiting_late_reason') {
+        // Fetched once, checked against every stateful multi-turn flow
+        // below (late-reason report, leave application) — was named
+        // lateReasonState back when that was the only such flow; kept
+        // generic now that leave application needs the same fetch.
+        const convState = await getConvState(tenant.id, from);
+        if (convState && convState.step === 'awaiting_late_reason') {
           const reason = message.text.body.trim();
           await deleteConvState(tenant.id, from);
           const sendInfoFn = (contact, msgText) => whatsapp.sendText(tenant, contact, msgText);
@@ -307,12 +365,84 @@ router.post('/', async (req, res) => {
             sendInfoFn,
             () => getLateReasonSummary(tenant.id, 'late_reason', {
               employeeName: employee.full_name,
-              checkinTime: lateReasonState.data.checkinTime,
-              lateMinutes: formatMinutesReadable(lateReasonState.data.lateMinutes),
+              checkinTime: convState.data.checkinTime,
+              lateMinutes: formatMinutesReadable(convState.data.lateMinutes),
               reason,
             })
           );
           await whatsapp.sendText(tenant, from, '✅ Reason recorded. Thank you for reporting.');
+          return;
+        }
+
+        // ── Leave application state machine ──────────────────────────
+        // apply_leave (button_reply, below) sets awaiting_leave_type to
+        // start this off. Each step re-prompts on invalid input rather
+        // than silently accepting garbage or falling through to the
+        // menu/check-in keyword checks further down.
+        if (convState && convState.step === 'awaiting_leave_type') {
+          const LEAVE_TYPE_MAP = {
+            '1': 'Annual Leave', 'annual': 'Annual Leave', 'annual leave': 'Annual Leave',
+            '2': 'Medical Leave', 'medical': 'Medical Leave', 'medical leave': 'Medical Leave',
+            '3': 'Emergency Leave', 'emergency': 'Emergency Leave', 'emergency leave': 'Emergency Leave',
+          };
+          const leaveType = LEAVE_TYPE_MAP[text];
+          if (!leaveType) {
+            await whatsapp.sendText(tenant, from, "Sorry, I didn't understand that. Please reply with 1, 2, or 3:\n\n1. Annual Leave\n2. Medical Leave\n3. Emergency Leave");
+            return;
+          }
+          await setConvState(tenant.id, from, { step: 'awaiting_leave_start', data: { leaveType } });
+          await whatsapp.sendText(tenant, from, '📅 What is your start date?\n\nFormat: YYYY-MM-DD or DD/MM/YYYY (e.g. 2026-08-01)');
+          return;
+        }
+
+        if (convState && convState.step === 'awaiting_leave_start') {
+          const startDate = parseDateFlexible(message.text.body);
+          if (!startDate) {
+            await whatsapp.sendText(tenant, from, "That doesn't look like a valid date. Please reply with your start date in YYYY-MM-DD or DD/MM/YYYY format.");
+            return;
+          }
+          await setConvState(tenant.id, from, { step: 'awaiting_leave_end', data: { ...convState.data, startDate } });
+          await whatsapp.sendText(tenant, from, '📅 What is your end date?\n\nFormat: YYYY-MM-DD or DD/MM/YYYY');
+          return;
+        }
+
+        if (convState && convState.step === 'awaiting_leave_end') {
+          const endDate = parseDateFlexible(message.text.body);
+          if (!endDate) {
+            await whatsapp.sendText(tenant, from, "That doesn't look like a valid date. Please reply with your end date in YYYY-MM-DD or DD/MM/YYYY format.");
+            return;
+          }
+          // Plain string comparison is safe here — both sides are
+          // zero-padded 'YYYY-MM-DD', so lexicographic order matches
+          // chronological order exactly.
+          if (endDate < convState.data.startDate) {
+            await whatsapp.sendText(tenant, from, `Your end date can't be before your start date (${convState.data.startDate}). Please reply with a valid end date.`);
+            return;
+          }
+          const totalDays = daysBetweenInclusive(convState.data.startDate, endDate);
+          await setConvState(tenant.id, from, { step: 'awaiting_leave_reason', data: { ...convState.data, endDate, totalDays } });
+          await whatsapp.sendText(tenant, from, '📝 Please provide a reason for your leave:');
+          return;
+        }
+
+        if (convState && convState.step === 'awaiting_leave_reason') {
+          const reason = message.text.body.trim();
+          if (!reason) {
+            await whatsapp.sendText(tenant, from, 'Please provide a reason for your leave.');
+            return;
+          }
+          await deleteConvState(tenant.id, from);
+          const { leaveType, startDate, endDate, totalDays } = convState.data;
+          const result = await createLeaveRequestWithApproval(tenant, employee, leaveType, startDate, endDate, totalDays, reason);
+          if (!result) {
+            await whatsapp.sendText(tenant, from, '❌ Failed to submit your leave request. Please try again or contact your admin.');
+            return;
+          }
+          await whatsapp.sendText(
+            tenant,
+            from,
+            `✅ *Leave Request Submitted*\n\n🏷️ Type: ${leaveType}\n📅 ${startDate} to ${endDate} (${totalDays} day${totalDays === 1 ? '' : 's'})\n📝 Reason: ${reason}\n\nYour request has been sent for approval.`
+          );
           return;
         }
 
@@ -445,12 +575,18 @@ router.post('/', async (req, res) => {
               { id: 'checkout', title: '🚪 Check Out' },
             ]);
             return;
+          } else if (listId === 'leave') {
+            // Same reasoning as checkin above — a real interactive
+            // prompt, handled outside the shared `reply` var.
+            await whatsapp.sendButtons(tenant, from, '📅 Leave Management\n\nWhat would you like to do?', [
+              { id: 'apply_leave', title: '📝 Apply for Leave' },
+              { id: 'leave_history', title: '📋 My Leave History' },
+            ]);
+            return;
           } else {
-            // dashboard/staff/leave/my_records — none of these have a
-            // real WhatsApp-native flow yet (leave DOES work
-            // end-to-end via createLeaveRequestWithApproval, but nothing
-            // in this text handler exposes it as a typed command today),
-            // so this is an honest placeholder, not a fake success reply.
+            // dashboard/staff/my_records — none of these have a real
+            // WhatsApp-native flow yet, so this is an honest
+            // placeholder, not a fake success reply.
             reply = '📊 View this in your Kapa Hub dashboard: [link]';
           }
           await whatsapp.sendText(tenant, from, reply);
@@ -494,6 +630,30 @@ router.post('/', async (req, res) => {
       }
       if (buttonId === 'checkout') {
         await startAttendanceFlow(tenant, from, 'out');
+        return;
+      }
+
+      // apply_leave/leave_history — same reasoning as checkin/checkout:
+      // checked ahead of the approve_/reject_ regexes, no collision
+      // risk with that naming pattern.
+      if (buttonId === 'apply_leave') {
+        await setConvState(tenant.id, from, { step: 'awaiting_leave_type', data: {} });
+        await whatsapp.sendText(tenant, from, 'What type of leave would you like to apply for?\n\n1. Annual Leave\n2. Medical Leave\n3. Emergency Leave\n\nReply with the type.');
+        return;
+      }
+      if (buttonId === 'leave_history') {
+        const employee = await getEmployeeByPhone(tenant.id, from);
+        if (!employee) {
+          await whatsapp.sendText(tenant, from, "We couldn't find your employee record. Please contact your admin.");
+          return;
+        }
+        const history = await getLeaveHistoryForEmployee(tenant.id, employee.id);
+        const reply = history.length
+          ? '📋 *Your Leave History*\n\n' + history.map((h) =>
+              `• ${h.leave_type}: ${h.start_date} to ${h.end_date} (${h.total_days} day${h.total_days === 1 ? '' : 's'}) — ${h.approval_status}`
+            ).join('\n')
+          : "You haven't submitted any leave requests yet.";
+        await whatsapp.sendText(tenant, from, reply);
         return;
       }
 

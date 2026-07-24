@@ -600,6 +600,27 @@ async function getRecentLeaveRequestsForTenant(tenantId, limit = 50) {
 }
 
 /**
+ * Same DATE_FORMAT-safe pattern as getRecentLeaveRequestsForTenant, just
+ * scoped to one employee — for the WhatsApp "My Leave History" reply,
+ * where a tenant-wide list would leak every other employee's requests
+ * to whoever asks.
+ */
+async function getLeaveHistoryForEmployee(tenantId, employeeId, limit = 10) {
+  const [rows] = await pool.query(
+    `SELECT id, leave_type,
+            DATE_FORMAT(start_date, '%Y-%m-%d') AS start_date,
+            DATE_FORMAT(end_date, '%Y-%m-%d') AS end_date,
+            total_days, reason, approval_status, approved_by, approved_at, created_at
+     FROM bot_leave_requests
+     WHERE tenant_id = ? AND employee_id = ?
+     ORDER BY created_at DESC
+     LIMIT ?`,
+    [tenantId, employeeId, limit]
+  );
+  return rows;
+}
+
+/**
  * Expense claims (bot_expense_claims) — plain async functions, same
  * precedent as leave above.
  */
@@ -1616,5 +1637,6 @@ module.exports = {
   updateDocumentReminderSentAt,
   getRecentAttendanceForTenant,
   getRecentLeaveRequestsForTenant,
+  getLeaveHistoryForEmployee,
   getEmployeesForTenant,
 };
