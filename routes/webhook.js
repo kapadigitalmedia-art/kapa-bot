@@ -352,11 +352,26 @@ router.post('/', async (req, res) => {
       // again) because by this point all that matters is "did this ID
       // come from our own Dine menu", not which industry the tenant is.
       const DINE_MENU_IDS = ['dashboard', 'inventory', 'staff', 'leave', 'foreign_worker_docs', 'checkin', 'my_records'];
+      // inventory/foreign_worker_docs/staff all surface tenant-wide data
+      // (every employee's low stock, every employee's expiring
+      // documents, the full staff directory) — gated to management
+      // roles, not just "any resolved employee" like the rest of this
+      // menu. checkin (Attendance) and leave stay open to everyone:
+      // both are the requester's own personal data/action, not
+      // business-wide information. manager is included alongside owner
+      // deliberately — a shift manager legitimately needs to see stock
+      // levels and the team roster without being the tenant's owner,
+      // same 'manager' role already used elsewhere in this codebase
+      // (kapa/Asia Avid's own seeded employees).
+      const MANAGEMENT_ONLY_IDS = ['inventory', 'foreign_worker_docs', 'staff'];
+      const MANAGEMENT_ROLES = ['owner', 'manager'];
       if (DINE_MENU_IDS.includes(listId)) {
         const employee = await getEmployeeByPhone(tenant.id, from);
         if (employee) {
           let reply;
-          if (listId === 'inventory') {
+          if (MANAGEMENT_ONLY_IDS.includes(listId) && !MANAGEMENT_ROLES.includes(employee.role)) {
+            reply = '🔒 This section is only available to managers/owners. Contact your manager for details.';
+          } else if (listId === 'inventory') {
             const lowStock = await getLowStockItems(tenant.id);
             reply = lowStock.length
               ? '📦 *Low Stock Alert*\n\n' + lowStock.map((item) =>
