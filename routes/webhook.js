@@ -26,6 +26,7 @@ const { broadcastNotifyOnly } = require('../services/approvalEngine');
 const { getLateReasonSummary } = require('../services/lateReason');
 const { sendIndustryPicker, handleIndustrySelection, simulateDemoCheckIn, simulateDemoCheckOut } = require('../services/prospectDemo');
 const { sendDineMenu } = require('../services/dineMenu');
+const { getPlaceName } = require('../services/geocoding');
 
 /**
  * conversationState is live, mid-conversation state for a real person
@@ -89,6 +90,22 @@ async function startAttendanceFlow(tenant, from, type) {
   await setConvState(tenant.id, from, { step: 'awaiting_location', data: { type } });
   const label = type === 'in' ? 'check-in' : 'check-out';
   await whatsapp.requestLocation(tenant, from, `📍 Please share your location to confirm ${label}.`);
+}
+
+/**
+ * record.check_in_time/check_out_time arrive as "HH:MM" (24-hour) —
+ * db-mysql.js's formatAttendanceRow slices the raw TIME column's
+ * "HH:MM:SS" down to "HH:MM", nothing more. Used in both the check-in
+ * and check-out confirmation messages so the same moment is never
+ * shown in two different formats across the two messages.
+ */
+function formatTime12h(time24) {
+  if (!time24) return time24;
+  const [hStr, mStr] = time24.split(':');
+  const h = parseInt(hStr, 10);
+  const period = h >= 12 ? 'PM' : 'AM';
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return `${h12}:${mStr} ${period}`;
 }
 
 /**
@@ -200,10 +217,16 @@ router.post('/', async (req, res) => {
           const statusLabel = record.attendance_status === 'Late'
             ? `Late (${record.late_minutes} min)`
             : record.attendance_status;
+          // Reverse-geocoded place name is a nice-to-have enrichment,
+          // never a requirement — getPlaceName already swallows its own
+          // failures and returns null, so a down/unreachable geocoding
+          // API just means no location line, not a broken confirmation.
+          const checkInPlaceName = await getPlaceName(lat, lng);
+          const checkInLocationLine = checkInPlaceName ? `\n📍 Location: ${checkInPlaceName}` : '';
           await whatsapp.sendText(
             tenant,
             from,
-            `✅ *Checked In*\n\nTime: ${record.check_in_time}\nStatus: ${statusLabel}`
+            `✅ *Checked In*\n\nTime: ${formatTime12h(record.check_in_time)}\nStatus: ${statusLabel}${checkInLocationLine}`
           );
 
           // Late-reason prompt — triggers on record.attendance_status === 'Late'
@@ -233,10 +256,12 @@ router.post('/', async (req, res) => {
             await whatsapp.sendText(tenant, from, '⚠️ No check-in found for today. Please check in first.');
             return;
           }
+          const checkOutPlaceName = await getPlaceName(lat, lng);
+          const checkOutLocationLine = checkOutPlaceName ? `\n📍 Location: ${checkOutPlaceName}` : '';
           await whatsapp.sendText(
             tenant,
             from,
-            `✅ *Checked Out*\n\nCheck-In: ${record.check_in_time}\nCheck-Out: ${record.check_out_time}`
+            `✅ *Checked Out*\n\nCheck-In: ${formatTime12h(record.check_in_time)}\nCheck-Out: ${formatTime12h(record.check_out_time)}${checkOutLocationLine}`
           );
         }
       } else {
