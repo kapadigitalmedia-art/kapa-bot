@@ -19,6 +19,8 @@ const {
   getEmployeesForTenant,
   getEmployeeByPhoneAnyTenant,
   createEmployeeForTenant,
+  getInventory,
+  updateInventoryStock,
 } = require('../services/db-mysql');
 const logger = require('../utils/logger');
 const { formatDateLocal } = require('../utils/dateFormat');
@@ -540,6 +542,28 @@ router.post('/', async (req, res) => {
           return;
         }
 
+        // update_stock (button_reply, below) sets awaiting_stock_item_
+        // selection, and the list_reply handler above moves it here
+        // once an item is picked — this is the final step, applying the
+        // typed quantity.
+        if (convState && convState.step === 'awaiting_stock_quantity') {
+          const rawQuantity = message.text.body.trim();
+          const quantity = Number(rawQuantity);
+          if (rawQuantity === '' || Number.isNaN(quantity) || quantity < 0) {
+            await whatsapp.sendText(tenant, from, "That doesn't look like a valid quantity. Please reply with a non-negative number (e.g. 10 or 12.5).");
+            return;
+          }
+          await deleteConvState(tenant.id, from);
+          const { itemId, itemName } = convState.data;
+          const success = await updateInventoryStock(tenant.id, itemId, quantity);
+          if (!success) {
+            await whatsapp.sendText(tenant, from, '❌ Failed to update stock. Please try again or contact support.');
+            return;
+          }
+          await whatsapp.sendText(tenant, from, `✅ *Stock Updated*\n\n📦 ${itemName || 'Item'}: ${quantity}`);
+          return;
+        }
+
         // Looked up once here and reused below by both the 'menu'
         // keyword check and the industry-specific greeting fallback —
         // only 'dine' has either today; every other industry (including
@@ -617,6 +641,48 @@ router.post('/', async (req, res) => {
     // ── 3. List replies — Dine menu selections, or prospect industry picker ──
     if (message.type === 'interactive' && message.interactive?.type === 'list_reply') {
       const listId = message.interactive.list_reply.id;
+      const MANAGEMENT_ROLES = ['owner', 'manager'];
+
+      // Fetched once, reused below by both the stock-item-selection
+      // check and the DINE_MENU_IDS handling that follows it (which
+      // used to fetch this itself).
+      const employee = await getEmployeeByPhone(tenant.id, from);
+
+      // Update Stock's item-selection reply — checked before
+      // DINE_MENU_IDS since these ids are arbitrary 'stock_item_<id>'
+      // strings (not one of the fixed menu ids below) and must be
+      // intercepted regardless of what they look like once this
+      // conv-state is active.
+      if (employee) {
+        const stockConvState = await getConvState(tenant.id, from);
+        if (stockConvState && stockConvState.step === 'awaiting_stock_item_selection') {
+          // Re-checked here, not just trusted from update_stock's own
+          // gate below — same reasoning as view_team/add_staff's
+          // re-check: a forged payload could in principle set this
+          // conv-state without ever passing through a real button tap.
+          if (!MANAGEMENT_ROLES.includes(employee.role)) {
+            await deleteConvState(tenant.id, from);
+            await whatsapp.sendText(tenant, from, '🔒 This section is only available to managers/owners. Contact your manager for details.');
+            return;
+          }
+          if (!listId.startsWith('stock_item_')) {
+            // Not a real item selection (e.g. a stale list from an
+            // earlier session) — ignore rather than guess.
+            return;
+          }
+          const itemId = listId.replace('stock_item_', '');
+          const items = await getInventory(tenant.id);
+          const selectedItem = items.find((i) => String(i.id) === itemId);
+          if (!selectedItem) {
+            await deleteConvState(tenant.id, from);
+            await whatsapp.sendText(tenant, from, "That item couldn't be found. Please start over from the Inventory menu.");
+            return;
+          }
+          await setConvState(tenant.id, from, { step: 'awaiting_stock_quantity', data: { itemId, itemName: selectedItem.item_name } });
+          await whatsapp.sendText(tenant, from, `What's the new stock quantity for ${selectedItem.item_name}?`);
+          return;
+        }
+      }
 
       // Only a resolved employee (real bot_employees row) could ever have
       // been sent sendDineMenu's list in the first place — a prospect
@@ -637,20 +703,20 @@ router.post('/', async (req, res) => {
       // same 'manager' role already used elsewhere in this codebase
       // (kapa/Asia Avid's own seeded employees).
       const MANAGEMENT_ONLY_IDS = ['inventory', 'foreign_worker_docs', 'staff'];
-      const MANAGEMENT_ROLES = ['owner', 'manager'];
       if (DINE_MENU_IDS.includes(listId)) {
-        const employee = await getEmployeeByPhone(tenant.id, from);
         if (employee) {
           let reply;
           if (MANAGEMENT_ONLY_IDS.includes(listId) && !MANAGEMENT_ROLES.includes(employee.role)) {
             reply = '🔒 This section is only available to managers/owners. Contact your manager for details.';
           } else if (listId === 'inventory') {
-            const lowStock = await getLowStockItems(tenant.id);
-            reply = lowStock.length
-              ? '📦 *Low Stock Alert*\n\n' + lowStock.map((item) =>
-                  `• ${item.item_name}: ${item.current_stock}${item.unit ? ' ' + item.unit : ''} (min: ${item.minimum_stock}${item.unit ? ' ' + item.unit : ''})`
-                ).join('\n')
-              : '✅ All stock levels are healthy!';
+            // Already gated to owner/manager by the MANAGEMENT_ONLY_IDS
+            // check above — a real interactive prompt, handled outside
+            // the shared `reply` var like checkin/leave/staff.
+            await whatsapp.sendButtons(tenant, from, '📦 Inventory\n\nWhat would you like to do?', [
+              { id: 'view_low_stock', title: '⚠️ View Low Stock' },
+              { id: 'update_stock', title: '✏️ Update Stock' },
+            ]);
+            return;
           } else if (listId === 'foreign_worker_docs') {
             const expiring = await getExpiringDocuments(tenant.id, 30);
             reply = expiring.length
@@ -790,6 +856,51 @@ router.post('/', async (req, res) => {
         // add_staff
         await setConvState(tenant.id, from, { step: 'awaiting_staff_name', data: {} });
         await whatsapp.sendText(tenant, from, "What's the new staff member's full name?");
+        return;
+      }
+
+      // view_low_stock/update_stock — same reasoning as view_team/
+      // add_staff above: this button_reply block is a separate code
+      // path from the list_reply branch's MANAGEMENT_ONLY_IDS gate, so
+      // the role check is repeated here rather than trusted implicitly.
+      if (buttonId === 'view_low_stock' || buttonId === 'update_stock') {
+        const employee = await getEmployeeByPhone(tenant.id, from);
+        if (!employee || !['owner', 'manager'].includes(employee.role)) {
+          await whatsapp.sendText(tenant, from, '🔒 This section is only available to managers/owners. Contact your manager for details.');
+          return;
+        }
+
+        if (buttonId === 'view_low_stock') {
+          const lowStock = await getLowStockItems(tenant.id);
+          const reply = lowStock.length
+            ? '📦 *Low Stock Alert*\n\n' + lowStock.map((item) =>
+                `• ${item.item_name}: ${item.current_stock}${item.unit ? ' ' + item.unit : ''} (min: ${item.minimum_stock}${item.unit ? ' ' + item.unit : ''})`
+              ).join('\n')
+            : '✅ All stock levels are healthy!';
+          await whatsapp.sendText(tenant, from, reply);
+          return;
+        }
+
+        // update_stock
+        const items = await getInventory(tenant.id);
+        if (!items.length) {
+          await whatsapp.sendText(tenant, from, 'No inventory items found. Add items via your Kapa Hub dashboard first.');
+          return;
+        }
+        // WhatsApp list messages cap at 10 rows total — a tenant with
+        // more than 10 items would need pagination this doesn't
+        // implement yet; capped here rather than silently failing the
+        // whole send by exceeding Meta's limit.
+        const sections = [{
+          title: 'Inventory Items',
+          rows: items.slice(0, 10).map((item) => ({
+            id: `stock_item_${item.id}`,
+            title: item.item_name,
+            description: `Stock: ${item.current_stock}${item.unit ? ' ' + item.unit : ''} (min: ${item.minimum_stock}${item.unit ? ' ' + item.unit : ''})`,
+          })),
+        }];
+        await whatsapp.sendList(tenant, from, '✏️ Update Stock\n\nSelect an item to update:', 'Choose Item', sections);
+        await setConvState(tenant.id, from, { step: 'awaiting_stock_item_selection', data: {} });
         return;
       }
 
