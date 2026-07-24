@@ -109,6 +109,18 @@ function formatTime12h(time24) {
 }
 
 /**
+ * "45m" under an hour; "10h 33m" at or past an hour, with the minutes
+ * part dropped entirely (not "2h 0m") when there's nothing left over.
+ */
+function formatMinutesReadable(totalMinutes) {
+  const minutes = Math.round(totalMinutes);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes === 0 ? `${hours}h` : `${hours}h ${remainingMinutes}m`;
+}
+
+/**
  * GET /webhook
  * One shared verify token works across every tenant's phone number, since
  * they can all live under the same Meta App (or you can add per-App
@@ -215,7 +227,7 @@ router.post('/', async (req, res) => {
             return;
           }
           const statusLabel = record.attendance_status === 'Late'
-            ? `Late (${record.late_minutes} min)`
+            ? `⚠️ You're ${formatMinutesReadable(record.late_minutes)} late`
             : record.attendance_status;
           // Reverse-geocoded place name is a nice-to-have enrichment,
           // never a requirement — getPlaceName already swallows its own
@@ -296,7 +308,7 @@ router.post('/', async (req, res) => {
             () => getLateReasonSummary(tenant.id, 'late_reason', {
               employeeName: employee.full_name,
               checkinTime: lateReasonState.data.checkinTime,
-              lateMinutes: lateReasonState.data.lateMinutes,
+              lateMinutes: formatMinutesReadable(lateReasonState.data.lateMinutes),
               reason,
             })
           );
