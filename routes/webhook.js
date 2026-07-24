@@ -21,6 +21,8 @@ const {
   createEmployeeForTenant,
   getInventory,
   updateInventoryStock,
+  getEmployeeById,
+  createForeignWorkerDocument,
 } = require('../services/db-mysql');
 const logger = require('../utils/logger');
 const { formatDateLocal } = require('../utils/dateFormat');
@@ -564,6 +566,45 @@ router.post('/', async (req, res) => {
           return;
         }
 
+        // ── Add-document state machine (continued) ────────────────────
+        // add_document → employee selection (list_reply, above) →
+        // doc-type selection (button_reply, above) → these two text
+        // steps → createForeignWorkerDocument.
+        if (convState && convState.step === 'awaiting_doc_number') {
+          const documentNumber = message.text.body.trim();
+          if (!documentNumber) {
+            await whatsapp.sendText(tenant, from, "Please provide the document number.");
+            return;
+          }
+          await setConvState(tenant.id, from, { step: 'awaiting_doc_expiry', data: { ...convState.data, documentNumber } });
+          await whatsapp.sendText(tenant, from, "📅 What's the expiry date? (YYYY-MM-DD or DD/MM/YYYY)");
+          return;
+        }
+
+        if (convState && convState.step === 'awaiting_doc_expiry') {
+          // Same parseDateFlexible validation as Leave's date prompts —
+          // rejects impossible/invalid dates, re-asks rather than
+          // silently accepting garbage.
+          const expiryDate = parseDateFlexible(message.text.body);
+          if (!expiryDate) {
+            await whatsapp.sendText(tenant, from, "That doesn't look like a valid date. Please reply with the expiry date in YYYY-MM-DD or DD/MM/YYYY format.");
+            return;
+          }
+          await deleteConvState(tenant.id, from);
+          const { employeeId, employeeName, documentType, documentNumber } = convState.data;
+          const result = await createForeignWorkerDocument(tenant.id, employeeId, employeeName, documentType, documentNumber, null, expiryDate);
+          if (!result) {
+            await whatsapp.sendText(tenant, from, '❌ Failed to add the document. Please try again or contact support.');
+            return;
+          }
+          await whatsapp.sendText(
+            tenant,
+            from,
+            `✅ *Document Added*\n\n👤 Employee: ${employeeName}\n🏷️ Type: ${documentType}\n🔢 Number: ${documentNumber}\n📅 Expires: ${expiryDate}`
+          );
+          return;
+        }
+
         // Looked up once here and reused below by both the 'menu'
         // keyword check and the industry-specific greeting fallback —
         // only 'dine' has either today; every other industry (including
@@ -643,45 +684,75 @@ router.post('/', async (req, res) => {
       const listId = message.interactive.list_reply.id;
       const MANAGEMENT_ROLES = ['owner', 'manager'];
 
-      // Fetched once, reused below by both the stock-item-selection
-      // check and the DINE_MENU_IDS handling that follows it (which
-      // used to fetch this itself).
+      // Fetched once, reused below by the stock-item-selection check,
+      // the doc-employee-selection check, and the DINE_MENU_IDS
+      // handling that follows both (which used to fetch employee
+      // itself).
       const employee = await getEmployeeByPhone(tenant.id, from);
+      const listReplyConvState = employee ? await getConvState(tenant.id, from) : null;
 
       // Update Stock's item-selection reply — checked before
       // DINE_MENU_IDS since these ids are arbitrary 'stock_item_<id>'
       // strings (not one of the fixed menu ids below) and must be
       // intercepted regardless of what they look like once this
       // conv-state is active.
-      if (employee) {
-        const stockConvState = await getConvState(tenant.id, from);
-        if (stockConvState && stockConvState.step === 'awaiting_stock_item_selection') {
-          // Re-checked here, not just trusted from update_stock's own
-          // gate below — same reasoning as view_team/add_staff's
-          // re-check: a forged payload could in principle set this
-          // conv-state without ever passing through a real button tap.
-          if (!MANAGEMENT_ROLES.includes(employee.role)) {
-            await deleteConvState(tenant.id, from);
-            await whatsapp.sendText(tenant, from, '🔒 This section is only available to managers/owners. Contact your manager for details.');
-            return;
-          }
-          if (!listId.startsWith('stock_item_')) {
-            // Not a real item selection (e.g. a stale list from an
-            // earlier session) — ignore rather than guess.
-            return;
-          }
-          const itemId = listId.replace('stock_item_', '');
-          const items = await getInventory(tenant.id);
-          const selectedItem = items.find((i) => String(i.id) === itemId);
-          if (!selectedItem) {
-            await deleteConvState(tenant.id, from);
-            await whatsapp.sendText(tenant, from, "That item couldn't be found. Please start over from the Inventory menu.");
-            return;
-          }
-          await setConvState(tenant.id, from, { step: 'awaiting_stock_quantity', data: { itemId, itemName: selectedItem.item_name } });
-          await whatsapp.sendText(tenant, from, `What's the new stock quantity for ${selectedItem.item_name}?`);
+      if (listReplyConvState && listReplyConvState.step === 'awaiting_stock_item_selection') {
+        // Re-checked here, not just trusted from update_stock's own
+        // gate below — same reasoning as view_team/add_staff's
+        // re-check: a forged payload could in principle set this
+        // conv-state without ever passing through a real button tap.
+        if (!MANAGEMENT_ROLES.includes(employee.role)) {
+          await deleteConvState(tenant.id, from);
+          await whatsapp.sendText(tenant, from, '🔒 This section is only available to managers/owners. Contact your manager for details.');
           return;
         }
+        if (!listId.startsWith('stock_item_')) {
+          // Not a real item selection (e.g. a stale list from an
+          // earlier session) — ignore rather than guess.
+          return;
+        }
+        const itemId = listId.replace('stock_item_', '');
+        const items = await getInventory(tenant.id);
+        const selectedItem = items.find((i) => String(i.id) === itemId);
+        if (!selectedItem) {
+          await deleteConvState(tenant.id, from);
+          await whatsapp.sendText(tenant, from, "That item couldn't be found. Please start over from the Inventory menu.");
+          return;
+        }
+        await setConvState(tenant.id, from, { step: 'awaiting_stock_quantity', data: { itemId, itemName: selectedItem.item_name } });
+        await whatsapp.sendText(tenant, from, `What's the new stock quantity for ${selectedItem.item_name}?`);
+        return;
+      }
+
+      // Add Document's employee-selection reply — same reasoning as
+      // stock-item-selection above: 'doc_employee_<id>' ids are
+      // arbitrary, checked before DINE_MENU_IDS.
+      if (listReplyConvState && listReplyConvState.step === 'awaiting_doc_employee_selection') {
+        if (!MANAGEMENT_ROLES.includes(employee.role)) {
+          await deleteConvState(tenant.id, from);
+          await whatsapp.sendText(tenant, from, '🔒 This section is only available to managers/owners. Contact your manager for details.');
+          return;
+        }
+        if (!listId.startsWith('doc_employee_')) {
+          return;
+        }
+        const selectedEmployeeId = listId.replace('doc_employee_', '');
+        const selectedEmployee = await getEmployeeById(tenant.id, selectedEmployeeId);
+        if (!selectedEmployee) {
+          await deleteConvState(tenant.id, from);
+          await whatsapp.sendText(tenant, from, "That employee couldn't be found. Please start over from the Foreign Worker Documents menu.");
+          return;
+        }
+        await setConvState(tenant.id, from, {
+          step: 'awaiting_doc_type',
+          data: { employeeId: selectedEmployee.id, employeeName: selectedEmployee.full_name },
+        });
+        await whatsapp.sendButtons(tenant, from, `📄 Document type for ${selectedEmployee.full_name}?`, [
+          { id: 'passport', title: '🛂 Passport' },
+          { id: 'visa', title: '📇 Visa' },
+          { id: 'work_permit', title: '💳 Work Permit' },
+        ]);
+        return;
       }
 
       // Only a resolved employee (real bot_employees row) could ever have
@@ -718,14 +789,14 @@ router.post('/', async (req, res) => {
             ]);
             return;
           } else if (listId === 'foreign_worker_docs') {
-            const expiring = await getExpiringDocuments(tenant.id, 30);
-            reply = expiring.length
-              ? '📄 *Expiring Documents*\n\n' + expiring.map((doc) => {
-                  const expiryStr = formatDateLocal(doc.expiry_date);
-                  const label = doc.status === 'expired' ? 'EXPIRED' : 'expiring soon';
-                  return `• ${doc.employee_name} — ${doc.document_type} expires ${expiryStr} (${label})`;
-                }).join('\n')
-              : '✅ No documents expiring in the next 30 days!';
+            // Already gated to owner/manager by the MANAGEMENT_ONLY_IDS
+            // check above — a real interactive prompt, handled outside
+            // the shared `reply` var like checkin/leave/staff/inventory.
+            await whatsapp.sendButtons(tenant, from, '🛂 Foreign Worker Documents\n\nWhat would you like to do?', [
+              { id: 'view_expiring_docs', title: '⚠️ View Expiring' },
+              { id: 'add_document', title: '➕ Add Document' },
+            ]);
+            return;
           } else if (listId === 'checkin') {
             // A real interactive prompt, not a plain-text reply — can't
             // join the shared `reply` var below, which only ever sends
@@ -901,6 +972,73 @@ router.post('/', async (req, res) => {
         }];
         await whatsapp.sendList(tenant, from, '✏️ Update Stock\n\nSelect an item to update:', 'Choose Item', sections);
         await setConvState(tenant.id, from, { step: 'awaiting_stock_item_selection', data: {} });
+        return;
+      }
+
+      // view_expiring_docs/add_document — same reasoning as
+      // view_low_stock/update_stock above: a separate code path from
+      // list_reply's MANAGEMENT_ONLY_IDS gate, so the role check is
+      // repeated here rather than trusted implicitly.
+      if (buttonId === 'view_expiring_docs' || buttonId === 'add_document') {
+        const employee = await getEmployeeByPhone(tenant.id, from);
+        if (!employee || !['owner', 'manager'].includes(employee.role)) {
+          await whatsapp.sendText(tenant, from, '🔒 This section is only available to managers/owners. Contact your manager for details.');
+          return;
+        }
+
+        if (buttonId === 'view_expiring_docs') {
+          const expiring = await getExpiringDocuments(tenant.id, 30);
+          const reply = expiring.length
+            ? '📄 *Expiring Documents*\n\n' + expiring.map((doc) => {
+                const expiryStr = formatDateLocal(doc.expiry_date);
+                const label = doc.status === 'expired' ? 'EXPIRED' : 'expiring soon';
+                return `• ${doc.employee_name} — ${doc.document_type} expires ${expiryStr} (${label})`;
+              }).join('\n')
+            : '✅ No documents expiring in the next 30 days!';
+          await whatsapp.sendText(tenant, from, reply);
+          return;
+        }
+
+        // add_document
+        const team = await getEmployeesForTenant(tenant.id);
+        if (!team.length) {
+          await whatsapp.sendText(tenant, from, 'No staff members found. Add a staff member first.');
+          return;
+        }
+        // Same 10-row WhatsApp list cap as Update Stock's item list —
+        // flagged there, not repeated in full here.
+        const sections = [{
+          title: 'Staff',
+          rows: team.slice(0, 10).map((e) => ({
+            id: `doc_employee_${e.id}`,
+            title: e.full_name,
+            description: e.role,
+          })),
+        }];
+        await whatsapp.sendList(tenant, from, '➕ Add Document\n\nSelect the employee:', 'Choose Employee', sections);
+        await setConvState(tenant.id, from, { step: 'awaiting_doc_employee_selection', data: {} });
+        return;
+      }
+
+      // Doc-type selection — gated on the actual conv-state, not just
+      // the button id: unlike checkin/apply_leave/view_team (which are
+      // always the start of their own flow), 'passport'/'visa'/
+      // 'work_permit' only mean anything mid-flow, so a stray tap with
+      // one of these ids outside awaiting_doc_type is ignored rather
+      // than guessed at.
+      if (buttonId === 'passport' || buttonId === 'visa' || buttonId === 'work_permit') {
+        const employee = await getEmployeeByPhone(tenant.id, from);
+        const docTypeConvState = employee ? await getConvState(tenant.id, from) : null;
+        if (!docTypeConvState || docTypeConvState.step !== 'awaiting_doc_type') {
+          return;
+        }
+        if (!['owner', 'manager'].includes(employee.role)) {
+          await deleteConvState(tenant.id, from);
+          await whatsapp.sendText(tenant, from, '🔒 This section is only available to managers/owners. Contact your manager for details.');
+          return;
+        }
+        await setConvState(tenant.id, from, { step: 'awaiting_doc_number', data: { ...docTypeConvState.data, documentType: buttonId } });
+        await whatsapp.sendText(tenant, from, "What's the document number?");
         return;
       }
 
