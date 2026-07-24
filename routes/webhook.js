@@ -273,7 +273,7 @@ router.post('/', async (req, res) => {
         // never reached, same as before this was added.
         const industrySlug = await getIndustryForTenant(tenant.id);
 
-        if (industrySlug === 'dine' && text === 'menu') {
+        if (industrySlug === 'dine' && ['menu', 'hi', 'hello', 'hey', 'start'].includes(text)) {
           await sendDineMenu(tenant, from, employee);
           return;
         }
