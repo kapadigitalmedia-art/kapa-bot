@@ -78,6 +78,20 @@ async function deleteConvState(tenantId, phone) {
 }
 
 /**
+ * Shared by both trigger paths for starting a check-in/check-out —
+ * typing "check in"/"check out" (text handler) and tapping the
+ * ✅ Check In/🚪 Check Out buttons (button_reply handler). What
+ * triggered it differs; the actual flow (set awaiting_location state,
+ * ask for a location share) must not — duplicating this between the
+ * two call sites would let them silently drift apart over time.
+ */
+async function startAttendanceFlow(tenant, from, type) {
+  await setConvState(tenant.id, from, { step: 'awaiting_location', data: { type } });
+  const label = type === 'in' ? 'check-in' : 'check-out';
+  await whatsapp.requestLocation(tenant, from, `📍 Please share your location to confirm ${label}.`);
+}
+
+/**
  * GET /webhook
  * One shared verify token works across every tenant's phone number, since
  * they can all live under the same Meta App (or you can add per-App
@@ -279,13 +293,11 @@ router.post('/', async (req, res) => {
         }
 
         if (tenant.features.attendance && ['check in', 'checkin', 'check-in'].includes(text)) {
-          await setConvState(tenant.id, from, { step: 'awaiting_location', data: { type: 'in' } });
-          await whatsapp.requestLocation(tenant, from, '📍 Please share your location to confirm check-in.');
+          await startAttendanceFlow(tenant, from, 'in');
           return;
         }
         if (tenant.features.attendance && ['check out', 'checkout', 'check-out'].includes(text)) {
-          await setConvState(tenant.id, from, { step: 'awaiting_location', data: { type: 'out' } });
-          await whatsapp.requestLocation(tenant, from, '📍 Please share your location to confirm check-out.');
+          await startAttendanceFlow(tenant, from, 'out');
           return;
         }
 
@@ -388,7 +400,14 @@ router.post('/', async (req, res) => {
                 }).join('\n')
               : '✅ No documents expiring in the next 30 days!';
           } else if (listId === 'checkin') {
-            reply = "Type 'check in' or 'check out' to use this directly.";
+            // A real interactive prompt, not a plain-text reply — can't
+            // join the shared `reply` var below, which only ever sends
+            // whatsapp.sendText.
+            await whatsapp.sendButtons(tenant, from, '📋 Attendance\n\nWhat would you like to do?', [
+              { id: 'checkin', title: '✅ Check In' },
+              { id: 'checkout', title: '🚪 Check Out' },
+            ]);
+            return;
           } else {
             // dashboard/staff/leave/my_records — none of these have a
             // real WhatsApp-native flow yet (leave DOES work
@@ -428,6 +447,19 @@ router.post('/', async (req, res) => {
     }
 
     if (buttonId) {
+      // checkin/checkout tap — identical flow to typing 'check in'/
+      // 'check out' in the text handler (both call startAttendanceFlow),
+      // just a different trigger. Checked ahead of the approve_/reject_
+      // regexes since these ids never collide with that naming pattern.
+      if (buttonId === 'checkin') {
+        await startAttendanceFlow(tenant, from, 'in');
+        return;
+      }
+      if (buttonId === 'checkout') {
+        await startAttendanceFlow(tenant, from, 'out');
+        return;
+      }
+
       // leave/expense/task_completion wired so far — overtime/quotation/
       // payroll_adjustment fall through to the generic reply below until
       // their handlers exist.
