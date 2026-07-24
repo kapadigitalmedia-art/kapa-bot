@@ -16,6 +16,9 @@ const {
   getLowStockItems,
   getExpiringDocuments,
   getLeaveHistoryForEmployee,
+  getEmployeesForTenant,
+  getEmployeeByPhoneAnyTenant,
+  createEmployeeForTenant,
 } = require('../services/db-mysql');
 const logger = require('../utils/logger');
 const { formatDateLocal } = require('../utils/dateFormat');
@@ -172,6 +175,19 @@ function daysBetweenInclusive(startDateStr, endDateStr) {
   const start = Date.UTC(sy, sm - 1, sd);
   const end = Date.UTC(ey, em - 1, ed);
   return Math.round((end - start) / (1000 * 60 * 60 * 24)) + 1;
+}
+
+/**
+ * Basic digit-count check for the add-staff flow's WhatsApp number
+ * prompt — not a real phone-number library, just enough to catch
+ * obvious non-numbers (e.g. someone typing a name by mistake) before
+ * the actual cross-tenant collision check runs. 8-15 matches real
+ * WhatsApp numbers seen elsewhere in this codebase (country code +
+ * subscriber number).
+ */
+function looksLikePhoneNumber(input) {
+  const digitsOnly = String(input || '').replace(/[\s+-]/g, '');
+  return /^\d{8,15}$/.test(digitsOnly);
 }
 
 /**
@@ -446,6 +462,84 @@ router.post('/', async (req, res) => {
           return;
         }
 
+        // ── Add-staff state machine ───────────────────────────────────
+        // add_staff (button_reply, above) sets awaiting_staff_name to
+        // start this off. Only ever reachable by someone who already
+        // passed the owner/manager check in that handler — this
+        // sequence doesn't re-check role, since setting conv-state and
+        // eventually creating an employee both happen under the same
+        // already-verified session as the button tap that started it.
+        if (convState && convState.step === 'awaiting_staff_name') {
+          const name = message.text.body.trim();
+          if (!name) {
+            await whatsapp.sendText(tenant, from, "Please provide the staff member's full name.");
+            return;
+          }
+          await setConvState(tenant.id, from, { step: 'awaiting_staff_number', data: { name } });
+          await whatsapp.sendText(tenant, from, "📱 What's their WhatsApp number? (include country code, e.g. 60123456789)");
+          return;
+        }
+
+        if (convState && convState.step === 'awaiting_staff_number') {
+          const rawNumber = message.text.body.trim();
+          if (!looksLikePhoneNumber(rawNumber)) {
+            await whatsapp.sendText(tenant, from, "That doesn't look like a valid WhatsApp number. Please reply with the number including country code (e.g. 60123456789).");
+            return;
+          }
+          // Cross-tenant, not just this tenant — whatsapp_number is only
+          // unique per-tenant (uq_tenant_whatsapp), so a number already
+          // used by an employee in a DIFFERENT tenant would otherwise
+          // create the exact ambiguous-employee collision
+          // tenantResolution.js already has to silently drop messages
+          // for (services/tenantResolution.js, 'ambiguous_employee').
+          // Checked here, before creation, rather than discovered after
+          // the fact.
+          const existing = await getEmployeeByPhoneAnyTenant(rawNumber);
+          if (existing.length > 0) {
+            await whatsapp.sendText(tenant, from, 'This number is already registered to an employee. Please provide a different WhatsApp number.');
+            return;
+          }
+          await setConvState(tenant.id, from, { step: 'awaiting_staff_role', data: { ...convState.data, whatsappNumber: rawNumber } });
+          await whatsapp.sendText(tenant, from, "🏷️ What's their role? (e.g. Waiter, Chef, Manager)");
+          return;
+        }
+
+        if (convState && convState.step === 'awaiting_staff_role') {
+          const role = message.text.body.trim();
+          if (!role) {
+            await whatsapp.sendText(tenant, from, "Please provide the staff member's role.");
+            return;
+          }
+          const { name, whatsappNumber } = convState.data;
+          // Re-checked immediately before the insert, not just trusted
+          // from the awaiting_staff_number step — a full round-trip (the
+          // role prompt) passed in between, a real window for a
+          // different concurrent request to register the same number.
+          // Narrows the race down to this last step instead of leaving
+          // the whole multi-message conversation exposed to it; not a
+          // real transaction/lock, same "as good as reasonably
+          // achievable" bar already accepted elsewhere in this codebase
+          // (e.g. createTrialSignup's own unwrapped multi-insert).
+          const stillFree = await getEmployeeByPhoneAnyTenant(whatsappNumber);
+          if (stillFree.length > 0) {
+            await deleteConvState(tenant.id, from);
+            await whatsapp.sendText(tenant, from, 'That number was just registered to another employee. Please start over with a different WhatsApp number.');
+            return;
+          }
+          await deleteConvState(tenant.id, from);
+          const result = await createEmployeeForTenant(tenant.id, name, whatsappNumber, role);
+          if (!result) {
+            await whatsapp.sendText(tenant, from, '❌ Failed to add the new staff member. Please try again or contact support.');
+            return;
+          }
+          await whatsapp.sendText(
+            tenant,
+            from,
+            `✅ *Staff Member Added*\n\n👤 Name: ${name}\n🏷️ Role: ${role}\n📱 WhatsApp: ${whatsappNumber}`
+          );
+          return;
+        }
+
         // Looked up once here and reused below by both the 'menu'
         // keyword check and the industry-specific greeting fallback —
         // only 'dine' has either today; every other industry (including
@@ -583,10 +677,19 @@ router.post('/', async (req, res) => {
               { id: 'leave_history', title: '📋 My Leave History' },
             ]);
             return;
+          } else if (listId === 'staff') {
+            // Already gated to owner/manager by the MANAGEMENT_ONLY_IDS
+            // check above — this branch is only ever reached for a
+            // caller already confirmed to have that role.
+            await whatsapp.sendButtons(tenant, from, '👥 Staff Management\n\nWhat would you like to do?', [
+              { id: 'view_team', title: '📋 View Team' },
+              { id: 'add_staff', title: '➕ Add Staff' },
+            ]);
+            return;
           } else {
-            // dashboard/staff/my_records — none of these have a real
-            // WhatsApp-native flow yet, so this is an honest
-            // placeholder, not a fake success reply.
+            // dashboard/my_records — neither has a real WhatsApp-native
+            // flow yet, so this is an honest placeholder, not a fake
+            // success reply.
             reply = '📊 View this in your Kapa Hub dashboard: [link]';
           }
           await whatsapp.sendText(tenant, from, reply);
@@ -654,6 +757,39 @@ router.post('/', async (req, res) => {
             ).join('\n')
           : "You haven't submitted any leave requests yet.";
         await whatsapp.sendText(tenant, from, reply);
+        return;
+      }
+
+      // view_team/add_staff — this button_reply block is a separate
+      // code path from the list_reply branch above, which is the ONLY
+      // place that gates 'staff' to owner/manager (MANAGEMENT_ONLY_IDS).
+      // Reaching this point in normal use means the sender already saw
+      // that gate (they're the only one who'd have been sent these
+      // buttons in the first place) — but a webhook payload's
+      // button_reply.id isn't otherwise re-verified against the
+      // original message, so the same role check is repeated here
+      // rather than trusted implicitly. Real tenant-wide staff data and
+      // employee creation are exactly the class of access
+      // MANAGEMENT_ONLY_IDS exists to restrict.
+      if (buttonId === 'view_team' || buttonId === 'add_staff') {
+        const employee = await getEmployeeByPhone(tenant.id, from);
+        if (!employee || !['owner', 'manager'].includes(employee.role)) {
+          await whatsapp.sendText(tenant, from, '🔒 This section is only available to managers/owners. Contact your manager for details.');
+          return;
+        }
+
+        if (buttonId === 'view_team') {
+          const team = await getEmployeesForTenant(tenant.id);
+          const reply = team.length
+            ? '👥 *Your Team*\n\n' + team.map((e) => `• ${e.full_name} — ${e.role} — ${e.whatsapp_number}`).join('\n')
+            : 'No staff members found.';
+          await whatsapp.sendText(tenant, from, reply);
+          return;
+        }
+
+        // add_staff
+        await setConvState(tenant.id, from, { step: 'awaiting_staff_name', data: {} });
+        await whatsapp.sendText(tenant, from, "What's the new staff member's full name?");
         return;
       }
 

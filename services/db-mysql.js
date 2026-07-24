@@ -1545,6 +1545,34 @@ async function getExpiringDocuments(tenantId, daysAhead) {
 }
 
 /**
+ * Adds a new bot_employees row for an existing tenant — the WhatsApp
+ * "Add Staff" flow's counterpart to createTrialSignup's own owner-row
+ * insert, same cleaned-number convention (getEmployeeByPhoneAnyTenant's
+ * cross-tenant collision check, run by the caller before this, relies
+ * on the exact same stripped format actually landing in the column).
+ * Callers are expected to have already checked for a colliding number
+ * — this function itself doesn't re-check, since uq_tenant_whatsapp
+ * only catches same-tenant collisions, not the cross-tenant case that
+ * matters more here.
+ */
+async function createEmployeeForTenant(tenantId, fullName, whatsappNumber, role) {
+  const cleanNumber = String(whatsappNumber || '').replace(/[\s\+\-]/g, '');
+  const [result] = await pool.execute(
+    'INSERT INTO bot_employees (tenant_id, full_name, whatsapp_number, role, is_active) VALUES (?, ?, ?, ?, TRUE)',
+    [tenantId, fullName, cleanNumber, role]
+  );
+  const insertId = result.insertId;
+
+  // Same defensive check applied to every other create* function in
+  // this file.
+  if (insertId === null || insertId === undefined) {
+    return null;
+  }
+
+  return { id: insertId };
+}
+
+/**
  * There's exactly one 'owner' row per tenant (createTrialSignup's
  * step-3 insert) — LIMIT 1 defensively rather than assuming that never
  * changes, but this isn't expected to ever match more than one row.
@@ -1633,6 +1661,7 @@ module.exports = {
   createForeignWorkerDocument,
   getForeignWorkerDocuments,
   getExpiringDocuments,
+  createEmployeeForTenant,
   getOwnerEmployee,
   updateDocumentReminderSentAt,
   getRecentAttendanceForTenant,
