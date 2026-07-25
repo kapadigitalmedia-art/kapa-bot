@@ -16,10 +16,21 @@ const {
   getRecentLeaveRequestsForTenant,
   getEmployeesForTenant,
   getEmployeeWithTenantName,
+  getEmployeeById,
+  upsertPaymentGateway,
+  isPaymentGatewayConnected,
 } = require('../services/db-mysql');
+const { encrypt } = require('../services/encryption');
 const logger = require('../utils/logger');
 
 const HUB_JWT_SECRET = process.env.HUB_JWT_SECRET;
+
+// Same role gate as routes/webhook.js's MANAGEMENT_ROLES (WhatsApp-side
+// Staff/Inventory management) — connecting a payment gateway is at least
+// as sensitive as those, so it gets the same owner/manager-only bar.
+// Nothing in hub.js enforced this before now; requireHubAuth only proves
+// *a* logged-in employee, not which role they hold.
+const MANAGEMENT_ROLES = ['owner', 'manager'];
 
 /**
  * Verifies the Bearer token issued by POST /login and attaches its
@@ -186,6 +197,49 @@ router.get('/staff', requireHubAuth, async (req, res) => {
     return res.json({ ok: true, employees });
   } catch (err) {
     logger.error('Hub GET /staff error:', err);
+    return res.status(500).json({ ok: false, error: 'Internal server error' });
+  }
+});
+
+// Re-fetches the employee row on every request (rather than trusting a
+// role claim baked into the JWT at login) — same reasoning webhook.js
+// gives for its own re-checks: role can change after a token was
+// issued, and a 7-day-lived Hub token (see /login) is long enough for
+// that to matter.
+router.post('/payment-gateway', requireHubAuth, async (req, res) => {
+  try {
+    const employee = await getEmployeeById(req.tenant_id, req.employee_id);
+    if (!employee || !MANAGEMENT_ROLES.includes(employee.role)) {
+      return res.status(403).json({ ok: false, error: 'Only owners/managers can connect a payment gateway' });
+    }
+
+    const { apiKey, salt } = req.body || {};
+    if (typeof apiKey !== 'string' || !apiKey.trim() || typeof salt !== 'string' || !salt.trim()) {
+      return res.status(400).json({ ok: false, error: 'apiKey and salt are both required' });
+    }
+
+    const apiKeyEncrypted = encrypt(apiKey.trim());
+    const saltEncrypted = encrypt(salt.trim());
+    await upsertPaymentGateway(req.tenant_id, apiKeyEncrypted, saltEncrypted, req.employee_id);
+
+    // Never echo apiKey/salt/their encrypted forms back — this response
+    // exists only to confirm the write succeeded.
+    return res.json({ ok: true, connected: true });
+  } catch (err) {
+    logger.error('Hub POST /payment-gateway error:', err);
+    return res.status(500).json({ ok: false, error: 'Internal server error' });
+  }
+});
+
+// No role gate — unlike POST, any authenticated employee (any role) can
+// check connection status. requireHubAuth is still required, so this
+// stays scoped to the caller's own tenant.
+router.get('/payment-gateway', requireHubAuth, async (req, res) => {
+  try {
+    const connected = await isPaymentGatewayConnected(req.tenant_id);
+    return res.json({ ok: true, connected });
+  } catch (err) {
+    logger.error('Hub GET /payment-gateway error:', err);
     return res.status(500).json({ ok: false, error: 'Internal server error' });
   }
 });

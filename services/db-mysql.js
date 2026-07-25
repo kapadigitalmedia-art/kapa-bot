@@ -1613,6 +1613,40 @@ async function updateDocumentReminderSentAt(tenantId, documentId) {
   return result.affectedRows > 0;
 }
 
+/**
+ * Callers pass already-encrypted values (services/encryption.js) — this
+ * function never sees plaintext. ON DUPLICATE KEY UPDATE against the
+ * UNIQUE(tenant_id) constraint from migration 028: a tenant reconnecting
+ * (new HitPay account, rotated key) overwrites its one row rather than
+ * erroring or creating a second. connected_at is bumped explicitly since
+ * it has no ON UPDATE CURRENT_TIMESTAMP clause — a reconnect should read
+ * as a fresh connection, not silently keep the original timestamp.
+ */
+async function upsertPaymentGateway(tenantId, apiKeyEncrypted, saltEncrypted, employeeId) {
+  await pool.execute(
+    `INSERT INTO bot_tenant_payment_gateways (tenant_id, api_key_encrypted, salt_encrypted, connected_by_employee_id)
+     VALUES (?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+       api_key_encrypted = VALUES(api_key_encrypted),
+       salt_encrypted = VALUES(salt_encrypted),
+       connected_by_employee_id = VALUES(connected_by_employee_id),
+       connected_at = CURRENT_TIMESTAMP,
+       is_active = TRUE`,
+    [tenantId, apiKeyEncrypted, saltEncrypted, employeeId]
+  );
+}
+
+// Boolean only, by design — the Hub UI's "Connected ✅" indicator has no
+// business ever seeing api_key_encrypted/salt_encrypted, encrypted or
+// not, so this deliberately selects nothing but the flag.
+async function isPaymentGatewayConnected(tenantId) {
+  const [rows] = await pool.query(
+    'SELECT is_active FROM bot_tenant_payment_gateways WHERE tenant_id = ?',
+    [tenantId]
+  );
+  return rows.length > 0 && !!rows[0].is_active;
+}
+
 module.exports = {
   pool,
   tenantDb,
@@ -1668,4 +1702,6 @@ module.exports = {
   getRecentLeaveRequestsForTenant,
   getLeaveHistoryForEmployee,
   getEmployeesForTenant,
+  upsertPaymentGateway,
+  isPaymentGatewayConnected,
 };
