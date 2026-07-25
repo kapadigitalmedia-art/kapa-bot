@@ -61,6 +61,7 @@ async function sendDineMenu(tenant, to, employee) {
     { id: 'inventory', title: '📦 Inventory', description: 'Check stock levels & low-stock alerts' },
     { id: 'foreign_worker_docs', title: '📄 Foreign Worker Docs', description: 'Passport/visa/permit expiry status' },
     { id: 'staff', title: '👥 Staff', description: 'View your team' },
+    { id: 'qr_code', title: '💰 QR Code', description: 'Generate a payment QR code' },
   ];
 
   const sections = [{ title: 'Menu', rows }];

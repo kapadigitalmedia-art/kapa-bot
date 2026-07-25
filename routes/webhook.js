@@ -23,6 +23,7 @@ const {
   updateInventoryStock,
   getEmployeeById,
   createForeignWorkerDocument,
+  isPaymentGatewayConnected,
 } = require('../services/db-mysql');
 const logger = require('../utils/logger');
 const { formatDateLocal } = require('../utils/dateFormat');
@@ -605,6 +606,42 @@ router.post('/', async (req, res) => {
           return;
         }
 
+        // QR Code's only text step — set directly by the 'qr_code'
+        // list_reply tap below (MANAGEMENT_ONLY_IDS-gated there, the
+        // same single interactive entry point inventory/foreign_worker_
+        // docs/staff are gated at), with no intermediate button_reply/
+        // list_reply hop in between the way Update Stock and Add
+        // Document have. Same pattern as awaiting_stock_quantity/
+        // awaiting_doc_number above: the one forgeable id in this flow
+        // was already re-checked, so this pure-text continuation
+        // doesn't repeat it.
+        if (convState && convState.step === 'awaiting_qr_amount') {
+          const rawAmount = message.text.body.trim();
+          const amount = Number(rawAmount);
+          if (rawAmount === '' || Number.isNaN(amount) || amount <= 0) {
+            await whatsapp.sendText(tenant, from, "That doesn't look like a valid amount. Please reply with a positive number (e.g. 45.50).");
+            return;
+          }
+          await deleteConvState(tenant.id, from);
+          const connected = await isPaymentGatewayConnected(tenant.id);
+          if (!connected) {
+            await whatsapp.sendText(
+              tenant,
+              from,
+              `🚧 QR code payments aren't live yet — your HitPay connection is still being set up. We'll notify you once it's ready.\n\n💰 Amount entered: RM ${amount.toFixed(2)}`
+            );
+            return;
+          }
+          // Placeholder until the real HitPay QR-generation call is
+          // built in a future session — isPaymentGatewayConnected
+          // returning true today only happens for a tenant that's
+          // actually gone through Settings and connected a real HitPay
+          // account, so this branch is future-proofing, not yet
+          // reachable by any real trial tenant.
+          await whatsapp.sendText(tenant, from, '⏳ Generating your QR code...');
+          return;
+        }
+
         // Looked up once here and reused below by both the 'menu'
         // keyword check and the industry-specific greeting fallback —
         // only 'dine' has either today; every other industry (including
@@ -761,7 +798,7 @@ router.post('/', async (req, res) => {
       // with these ids. Checked here (not gated on industrySlug === 'dine'
       // again) because by this point all that matters is "did this ID
       // come from our own Dine menu", not which industry the tenant is.
-      const DINE_MENU_IDS = ['dashboard', 'inventory', 'staff', 'leave', 'foreign_worker_docs', 'checkin', 'my_records'];
+      const DINE_MENU_IDS = ['dashboard', 'inventory', 'staff', 'leave', 'foreign_worker_docs', 'checkin', 'my_records', 'qr_code'];
       // inventory/foreign_worker_docs/staff all surface tenant-wide data
       // (every employee's low stock, every employee's expiring
       // documents, the full staff directory) — gated to management
@@ -773,7 +810,7 @@ router.post('/', async (req, res) => {
       // levels and the team roster without being the tenant's owner,
       // same 'manager' role already used elsewhere in this codebase
       // (kapa/Asia Avid's own seeded employees).
-      const MANAGEMENT_ONLY_IDS = ['inventory', 'foreign_worker_docs', 'staff'];
+      const MANAGEMENT_ONLY_IDS = ['inventory', 'foreign_worker_docs', 'staff', 'qr_code'];
       if (DINE_MENU_IDS.includes(listId)) {
         if (employee) {
           let reply;
@@ -822,6 +859,15 @@ router.post('/', async (req, res) => {
               { id: 'view_team', title: '📋 View Team' },
               { id: 'add_staff', title: '➕ Add Staff' },
             ]);
+            return;
+          } else if (listId === 'qr_code') {
+            // Already gated to owner/manager by the MANAGEMENT_ONLY_IDS
+            // check above. Goes straight to a text prompt rather than
+            // an interim button submenu (unlike inventory/staff/docs) —
+            // there's only one action here, generate a QR for an
+            // amount, not a choice between two.
+            await setConvState(tenant.id, from, { step: 'awaiting_qr_amount', data: {} });
+            await whatsapp.sendText(tenant, from, "💰 What's the amount to charge? (e.g. 45.50)");
             return;
           } else {
             // dashboard/my_records — neither has a real WhatsApp-native
