@@ -36,6 +36,7 @@ const { getLateReasonSummary } = require('../services/lateReason');
 const { sendIndustryPicker, handleIndustrySelection, simulateDemoCheckIn, simulateDemoCheckOut } = require('../services/prospectDemo');
 const { sendDineMenu } = require('../services/dineMenu');
 const { getPlaceName } = require('../services/geocoding');
+const { createQrToken } = require('../services/qrTokens');
 
 /**
  * conversationState is live, mid-conversation state for a real person
@@ -630,15 +631,27 @@ router.post('/', async (req, res) => {
               from,
               `🚧 QR code payments aren't live yet — your HitPay connection is still being set up. We'll notify you once it's ready.\n\n💰 Amount entered: RM ${amount.toFixed(2)}`
             );
-            return;
+          } else {
+            // Placeholder until the real HitPay QR-generation call is
+            // built in a future session — isPaymentGatewayConnected
+            // returning true today only happens for a tenant that's
+            // actually gone through Settings and connected a real
+            // HitPay account, so this branch is future-proofing, not
+            // yet reachable by any real trial tenant.
+            await whatsapp.sendText(tenant, from, '⏳ Generating your QR code...');
           }
-          // Placeholder until the real HitPay QR-generation call is
-          // built in a future session — isPaymentGatewayConnected
-          // returning true today only happens for a tenant that's
-          // actually gone through Settings and connected a real HitPay
-          // account, so this branch is future-proofing, not yet
-          // reachable by any real trial tenant.
-          await whatsapp.sendText(tenant, from, '⏳ Generating your QR code...');
+
+          // Real, scannable demo QR sent regardless of connection status
+          // — a follow-up after the honest status text above, not a
+          // replacement for it. Encodes a plain demo string, not a real
+          // HitPay payment link (there's no real gateway to link to
+          // yet), so this is for showing a prospect the QR-scan
+          // experience during a demo, not for actually charging anyone.
+          const qrText = `KAPA ONE Dine - Demo Payment - RM${amount.toFixed(2)}`;
+          const token = createQrToken(qrText);
+          const baseUrl = process.env.PUBLIC_BASE_URL || 'https://kapa-bot-production.up.railway.app';
+          const imageUrl = `${baseUrl}/qr/${token}.png`;
+          await whatsapp.sendImage(tenant, from, imageUrl, `💳 Scan to demo - RM${amount.toFixed(2)}`);
           return;
         }
 

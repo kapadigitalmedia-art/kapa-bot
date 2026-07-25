@@ -183,4 +183,45 @@ async function sendList(tenant, to, bodyText, buttonText, sections) {
   }
 }
 
-module.exports = { sendText, sendToOffice, sendToAllAdmins, requestLocation, sendButtons, sendList };
+/**
+ * Send an image message — used for the QR Code flow's generated PNG
+ * (routes/qr.js). imageUrl must be a publicly fetchable HTTPS URL;
+ * Meta's servers fetch it themselves rather than accepting raw image
+ * bytes here, same 'link' shape as every other message type in this
+ * file that references media.
+ */
+async function sendImage(tenant, to, imageUrl, caption) {
+  if (!tenant) return { ok: false, error: 'Unknown tenant' };
+  if (!to) return { ok: false, error: 'Missing destination number' };
+
+  const accessToken = tenant.accessTokenOverride || config.meta.accessToken;
+  const phoneNumberId = tenant.phoneNumberId;
+
+  if (!accessToken || !phoneNumberId) {
+    logger.info(`[MOCK MODE] [${tenant.id}] Would send image to ${to}: ${imageUrl}${caption ? ' | caption=' + caption : ''}`);
+    return { ok: true, mock: true };
+  }
+
+  const url = `https://graph.facebook.com/${config.meta.graphApiVersion}/${phoneNumberId}/messages`;
+
+  try {
+    const res = await axios.post(
+      url,
+      {
+        messaging_product: 'whatsapp',
+        to,
+        type: 'image',
+        image: { link: imageUrl, caption },
+      },
+      { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' }, timeout: 15000 }
+    );
+    logger.info(`[${tenant.id}] WhatsApp image sent -> ${to} | messageId=${res.data?.messages?.[0]?.id || 'n/a'}`);
+    return { ok: true, data: res.data };
+  } catch (err) {
+    const detail = err.response?.data || err.message;
+    logger.error(`[${tenant.id}] WhatsApp image send FAILED -> ${to}`, detail);
+    return { ok: false, error: JSON.stringify(detail) };
+  }
+}
+
+module.exports = { sendText, sendToOffice, sendToAllAdmins, requestLocation, sendButtons, sendList, sendImage };

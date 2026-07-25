@@ -15,6 +15,7 @@ const productsRoutes = require('./routes/products');
 const trialSignupRoutes = require('./routes/trialSignup');
 const adminSignupsRoutes = require('./routes/adminSignups');
 const hubRoutes = require('./routes/hub');
+const qrRoutes = require('./routes/qr');
 
 const app = express();
 
@@ -79,6 +80,11 @@ app.get('/', (req, res) => {
 
 // ── WhatsApp webhook — shared across every tenant, no API key needed ────
 app.use('/webhook', webhookRoutes);
+
+// ── QR code images — public, fetched directly by WhatsApp/Meta's own
+//    servers when a QR message is sent, so no api-key/tenant gate here
+//    either. Gated instead by the token itself (see routes/qr.js) ──────
+app.use('/qr', qrRoutes);
 
 // ── Internal API routes — tenant resolved from x-api-key ────────────────
 app.use('/api/leads', requireTenant, leadsRoutes);
