@@ -756,22 +756,27 @@ router.post('/', async (req, res) => {
           await whatsapp.sendText(tenant, from, '🔒 This section is only available to managers/owners. Contact your manager for details.');
           return;
         }
-        if (!listId.startsWith('stock_item_')) {
-          // Not a real item selection (e.g. a stale list from an
-          // earlier session) — ignore rather than guess.
+        if (listId.startsWith('stock_item_')) {
+          const itemId = listId.replace('stock_item_', '');
+          const items = await getInventory(tenant.id);
+          const selectedItem = items.find((i) => String(i.id) === itemId);
+          if (!selectedItem) {
+            await deleteConvState(tenant.id, from);
+            await whatsapp.sendText(tenant, from, "That item couldn't be found. Please start over from the Inventory menu.");
+            return;
+          }
+          await setConvState(tenant.id, from, { step: 'awaiting_stock_quantity', data: { itemId, itemName: selectedItem.item_name } });
+          await whatsapp.sendText(tenant, from, `What's the new stock quantity for ${selectedItem.item_name}?`);
           return;
         }
-        const itemId = listId.replace('stock_item_', '');
-        const items = await getInventory(tenant.id);
-        const selectedItem = items.find((i) => String(i.id) === itemId);
-        if (!selectedItem) {
-          await deleteConvState(tenant.id, from);
-          await whatsapp.sendText(tenant, from, "That item couldn't be found. Please start over from the Inventory menu.");
-          return;
-        }
-        await setConvState(tenant.id, from, { step: 'awaiting_stock_quantity', data: { itemId, itemName: selectedItem.item_name } });
-        await whatsapp.sendText(tenant, from, `What's the new stock quantity for ${selectedItem.item_name}?`);
-        return;
+        // Not a real item selection — this tap is for something else
+        // entirely (e.g. the user backed out to the main menu and hit
+        // Attendance/Leave/etc instead of finishing Update Stock). Clear
+        // the stale state and fall through to the normal DINE_MENU_IDS
+        // dispatch below so this same tap still gets handled, rather
+        // than silently dropping it and leaving the user stuck until
+        // they happen to send a stock_item_* id.
+        await deleteConvState(tenant.id, from);
       }
 
       // Add Document's employee-selection reply — same reasoning as
@@ -783,26 +788,30 @@ router.post('/', async (req, res) => {
           await whatsapp.sendText(tenant, from, '🔒 This section is only available to managers/owners. Contact your manager for details.');
           return;
         }
-        if (!listId.startsWith('doc_employee_')) {
+        if (listId.startsWith('doc_employee_')) {
+          const selectedEmployeeId = listId.replace('doc_employee_', '');
+          const selectedEmployee = await getEmployeeById(tenant.id, selectedEmployeeId);
+          if (!selectedEmployee) {
+            await deleteConvState(tenant.id, from);
+            await whatsapp.sendText(tenant, from, "That employee couldn't be found. Please start over from the Foreign Worker Documents menu.");
+            return;
+          }
+          await setConvState(tenant.id, from, {
+            step: 'awaiting_doc_type',
+            data: { employeeId: selectedEmployee.id, employeeName: selectedEmployee.full_name },
+          });
+          await whatsapp.sendButtons(tenant, from, `📄 Document type for ${selectedEmployee.full_name}?`, [
+            { id: 'passport', title: '🛂 Passport' },
+            { id: 'visa', title: '📇 Visa' },
+            { id: 'work_permit', title: '💳 Work Permit' },
+          ]);
           return;
         }
-        const selectedEmployeeId = listId.replace('doc_employee_', '');
-        const selectedEmployee = await getEmployeeById(tenant.id, selectedEmployeeId);
-        if (!selectedEmployee) {
-          await deleteConvState(tenant.id, from);
-          await whatsapp.sendText(tenant, from, "That employee couldn't be found. Please start over from the Foreign Worker Documents menu.");
-          return;
-        }
-        await setConvState(tenant.id, from, {
-          step: 'awaiting_doc_type',
-          data: { employeeId: selectedEmployee.id, employeeName: selectedEmployee.full_name },
-        });
-        await whatsapp.sendButtons(tenant, from, `📄 Document type for ${selectedEmployee.full_name}?`, [
-          { id: 'passport', title: '🛂 Passport' },
-          { id: 'visa', title: '📇 Visa' },
-          { id: 'work_permit', title: '💳 Work Permit' },
-        ]);
-        return;
+        // Same reasoning as the stock-item-selection case above: a tap
+        // that isn't a real doc_employee_* selection means the user has
+        // moved on to something else — clear the stale state and fall
+        // through rather than silently dropping this tap.
+        await deleteConvState(tenant.id, from);
       }
 
       // Only a resolved employee (real bot_employees row) could ever have

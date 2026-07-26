@@ -1647,6 +1647,94 @@ async function isPaymentGatewayConnected(tenantId) {
   return rows.length > 0 && !!rows[0].is_active;
 }
 
+/**
+ * dateStr is 'YYYY-MM-DD', a full Asia/Kuala_Lumpur calendar day —
+ * design reviewed and confirmed before writing this (see the two
+ * date-scoping decisions below).
+ *
+ * Attendance is scoped by attendance_date, a plain DATE column the
+ * application itself writes as toDateStr(nowInKualaLumpur()) at
+ * check-in time (see createCheckIn above) — DATE columns carry no time
+ * component and no timezone conversion, so comparing it directly
+ * against dateStr is safe regardless of this MySQL server's own
+ * session time_zone.
+ *
+ * QR payments can't use the same trick: bot_dine_sales.paid_at is a
+ * TIMESTAMP, and this server's session time_zone resolves to SYSTEM
+ * (confirmed via SELECT @@session.time_zone, NOW(), UTC_TIMESTAMP() —
+ * NOW() came back identical to UTC_TIMESTAMP()), meaning a naive
+ * DATE(paid_at) = ? would bucket by the UTC calendar day, not KL —
+ * silently off by 8 hours, splitting every true KL business day across
+ * two UTC dates. Fixed by converting dateStr into the actual UTC
+ * instant range that KL day spans (KL is a fixed +08:00 offset, no
+ * DST) and comparing with >= / < rather than wrapping the column in a
+ * function — same "do timezone math in JS, not SQL" convention
+ * nowInKualaLumpur/toDateStr already use elsewhere in this file, and
+ * keeps the comparison sargable if paid_at ever gets indexed.
+ *
+ * lowStock needs no date-scoping at all — getLowStockItems is a
+ * current-state snapshot (current_stock vs minimum_stock right now),
+ * not a historical record, so "low stock as of dateStr" isn't a
+ * meaningful question to ask; today's actual stock levels are reused
+ * as-is regardless of which dateStr was requested.
+ */
+async function getDailyBusinessSummary(tenantId, dateStr) {
+  const [statusRows] = await pool.query(
+    `SELECT attendance_status, COUNT(*) AS cnt
+     FROM bot_employee_attendance
+     WHERE tenant_id = ? AND attendance_date = ?
+     GROUP BY attendance_status`,
+    [tenantId, dateStr]
+  );
+  const [[{ total }]] = await pool.query(
+    'SELECT COUNT(*) AS total FROM bot_employees WHERE tenant_id = ? AND is_active = TRUE',
+    [tenantId]
+  );
+  const present = statusRows.find((r) => r.attendance_status === 'Present')?.cnt || 0;
+  const late = statusRows.find((r) => r.attendance_status === 'Late')?.cnt || 0;
+  // Clamped rather than left to go negative — a since-deactivated
+  // employee who checked in earlier that same day (present/late counts
+  // a historical attendance row, `total` counts CURRENT is_active
+  // headcount) could otherwise push present+late above total.
+  const absent = Math.max(0, total - present - late);
+
+  // rangeStart/rangeEnd are passed as literal UTC strings, not Date
+  // objects — this pool is configured with timezone: '+08:00' (see top of
+  // file), which makes mysql2 shift every Date-object parameter by +8h
+  // before sending it as a naked SQL literal. Since this server's actual
+  // session time_zone is SYSTEM (= UTC, per the comment above), that
+  // shifted literal then gets reinterpreted as UTC by MySQL — a double
+  // shift that silently re-introduces the exact 8-hour bucketing bug this
+  // function exists to avoid. Proven against real data before landing:
+  // with Date objects, a payment at 2026-07-25 07:00 KL (2026-07-24 23:00
+  // UTC) was attributed to 2026-07-24 instead of 2026-07-25. Strings pass
+  // through mysql2 unconverted, so formatting the UTC instant ourselves
+  // and sending it as text sidesteps the driver's conversion entirely.
+  const rangeStart = new Date(`${dateStr}T00:00:00+08:00`);
+  const rangeEnd = new Date(rangeStart.getTime() + 24 * 60 * 60 * 1000);
+  const toMysqlUtcString = (d) => d.toISOString().slice(0, 19).replace('T', ' ');
+  const [[{ count, totalAmount }]] = await pool.query(
+    `SELECT COUNT(*) AS count, COALESCE(SUM(amount), 0) AS totalAmount
+     FROM bot_dine_sales
+     WHERE tenant_id = ? AND status = 'paid' AND paid_at >= ? AND paid_at < ?`,
+    [tenantId, toMysqlUtcString(rangeStart), toMysqlUtcString(rangeEnd)]
+  );
+
+  const lowStockRows = await getLowStockItems(tenantId);
+
+  return {
+    date: dateStr,
+    attendance: { present, late, absent, total },
+    lowStockCount: lowStockRows.length,
+    lowStockItems: lowStockRows.map((r) => ({
+      item_name: r.item_name,
+      current_stock: r.current_stock,
+      minimum_stock: r.minimum_stock,
+    })),
+    qrPayments: { count, totalAmount: Number(totalAmount) },
+  };
+}
+
 module.exports = {
   pool,
   tenantDb,
@@ -1704,4 +1792,5 @@ module.exports = {
   getEmployeesForTenant,
   upsertPaymentGateway,
   isPaymentGatewayConnected,
+  getDailyBusinessSummary,
 };
