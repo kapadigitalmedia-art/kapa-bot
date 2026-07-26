@@ -22,6 +22,19 @@ const { isGatedRequestType } = require('../config/requestTypes');
 
 const BUTTON_ID_PATTERN = /^(approve|reject)_(.+)_(\d+)_(\d+)$/;
 
+const REQUEST_TYPE_LABELS = {
+  leave: 'leave request',
+  expense: 'expense claim',
+  task_completion: 'task',
+  overtime: 'overtime request',
+  quotation: 'quotation',
+  payroll_adjustment: 'payroll adjustment request',
+};
+
+function getRequestTypeLabel(requestType) {
+  return REQUEST_TYPE_LABELS[requestType] || 'request';
+}
+
 function cleanNumber(n) {
   return String(n || '').replace(/[\s+-]/g, '');
 }
@@ -219,7 +232,7 @@ async function handleApprovalReply(tenantId, buttonId, fromNumber, sendButtonsFn
     const won = await completeApprovalProgress(tenantId, requestType, recordId, progress.current_step_order);
     if (!won) return { ok: false, message: 'This request has already been resolved.' };
     await updateStatusFn(tenantId, recordId, 'Approved', fromNumber);
-    return { ok: true, final: true, decision: 'Approved', message: '✅ Approved (final step).' };
+    return { ok: true, final: true, decision: 'Approved', message: `✅ Your ${getRequestTypeLabel(requestType)} has been fully approved!` };
   }
 
   const nextStepOrder = Math.min(...nextRows.map((r) => r.step_order));
@@ -232,7 +245,7 @@ async function handleApprovalReply(tenantId, buttonId, fromNumber, sendButtonsFn
     const won = await completeApprovalProgress(tenantId, requestType, recordId, progress.current_step_order);
     if (!won) return { ok: false, message: 'This request has already been resolved.' };
     await updateStatusFn(tenantId, recordId, 'Approved', fromNumber);
-    return { ok: true, final: true, decision: 'Approved', message: '✅ Approved (final step).' };
+    return { ok: true, final: true, decision: 'Approved', message: `✅ Your ${getRequestTypeLabel(requestType)} has been fully approved!` };
   }
 
   const won = await advanceApprovalProgress(tenantId, requestType, recordId, progress.current_step_order, nextStepOrder, nextApproverRows[0].id);
