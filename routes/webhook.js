@@ -679,40 +679,55 @@ router.post('/', async (req, res) => {
         if (convState && convState.step === 'awaiting_qr_amount') {
           const rawAmount = message.text.body.trim();
           const amount = Number(rawAmount);
-          if (rawAmount === '' || Number.isNaN(amount) || amount <= 0) {
+          const isInvalidAmount = rawAmount === '' || Number.isNaN(amount) || amount <= 0;
+
+          if (isInvalidAmount && /[a-zA-Z]/.test(rawAmount)) {
+            // Contains letters — not a plausible amount-entry attempt at
+            // all (e.g. the user gave up on the QR flow and typed
+            // 'menu' or 'check in' instead). Clear the stale state and
+            // fall through to normal dispatch below, rather than
+            // trapping them behind "that doesn't look like a valid
+            // amount" no matter what they type.
+            await deleteConvState(tenant.id, from);
+          } else if (isInvalidAmount) {
+            // Still numeric-ish garbage ("12.5.5", empty, negative/
+            // zero) — a genuine, if malformed, attempt at an amount, so
+            // re-ask rather than bailing.
             await whatsapp.sendText(tenant, from, "That doesn't look like a valid amount. Please reply with a positive number (e.g. 45.50).");
             return;
-          }
-          await deleteConvState(tenant.id, from);
-          const connected = await isPaymentGatewayConnected(tenant.id);
-          if (!connected) {
-            await whatsapp.sendText(
-              tenant,
-              from,
-              `🚧 QR code payments aren't live yet — your HitPay connection is still being set up. We'll notify you once it's ready.\n\n💰 Amount entered: RM ${amount.toFixed(2)}`
-            );
           } else {
-            // Placeholder until the real HitPay QR-generation call is
-            // built in a future session — isPaymentGatewayConnected
-            // returning true today only happens for a tenant that's
-            // actually gone through Settings and connected a real
-            // HitPay account, so this branch is future-proofing, not
-            // yet reachable by any real trial tenant.
-            await whatsapp.sendText(tenant, from, '⏳ Generating your QR code...');
-          }
+            await deleteConvState(tenant.id, from);
+            const connected = await isPaymentGatewayConnected(tenant.id);
+            if (!connected) {
+              await whatsapp.sendText(
+                tenant,
+                from,
+                `🚧 QR code payments aren't live yet — your HitPay connection is still being set up. We'll notify you once it's ready.\n\n💰 Amount entered: RM ${amount.toFixed(2)}`
+              );
+            } else {
+              // Placeholder until the real HitPay QR-generation call is
+              // built in a future session — isPaymentGatewayConnected
+              // returning true today only happens for a tenant that's
+              // actually gone through Settings and connected a real
+              // HitPay account, so this branch is future-proofing, not
+              // yet reachable by any real trial tenant.
+              await whatsapp.sendText(tenant, from, '⏳ Generating your QR code...');
+            }
 
-          // Real, scannable demo QR sent regardless of connection status
-          // — a follow-up after the honest status text above, not a
-          // replacement for it. Encodes a plain demo string, not a real
-          // HitPay payment link (there's no real gateway to link to
-          // yet), so this is for showing a prospect the QR-scan
-          // experience during a demo, not for actually charging anyone.
-          const qrText = `KAPA ONE Dine - Demo Payment - RM${amount.toFixed(2)}`;
-          const token = createQrToken(qrText);
-          const baseUrl = process.env.PUBLIC_BASE_URL || 'https://kapa-bot-production.up.railway.app';
-          const imageUrl = `${baseUrl}/qr/${token}.png`;
-          await whatsapp.sendImage(tenant, from, imageUrl, `💳 Scan to demo - RM${amount.toFixed(2)}`);
-          return;
+            // Real, scannable demo QR sent regardless of connection
+            // status — a follow-up after the honest status text above,
+            // not a replacement for it. Encodes a plain demo string,
+            // not a real HitPay payment link (there's no real gateway
+            // to link to yet), so this is for showing a prospect the
+            // QR-scan experience during a demo, not for actually
+            // charging anyone.
+            const qrText = `KAPA ONE Dine - Demo Payment - RM${amount.toFixed(2)}`;
+            const token = createQrToken(qrText);
+            const baseUrl = process.env.PUBLIC_BASE_URL || 'https://kapa-bot-production.up.railway.app';
+            const imageUrl = `${baseUrl}/qr/${token}.png`;
+            await whatsapp.sendImage(tenant, from, imageUrl, `💳 Scan to demo - RM${amount.toFixed(2)}`);
+            return;
+          }
         }
 
         // Looked up once here and reused below by both the 'menu'
