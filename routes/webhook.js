@@ -21,6 +21,7 @@ const {
   createEmployeeForTenant,
   getInventory,
   updateInventoryStock,
+  createInventoryItem,
   getEmployeeById,
   createForeignWorkerDocument,
   isPaymentGatewayConnected,
@@ -554,6 +555,79 @@ router.post('/', async (req, res) => {
           return;
         }
 
+        // ── Add-item state machine ─────────────────────────────────────
+        // add_item (button_reply, below) sets awaiting_item_name to
+        // start this off. Only ever reachable by someone who already
+        // passed the owner/manager check in that handler — same
+        // reasoning as add_staff above, this sequence doesn't re-check
+        // role at each step.
+        if (convState && convState.step === 'awaiting_item_name') {
+          const name = message.text.body.trim();
+          if (!name) {
+            await whatsapp.sendText(tenant, from, 'Please provide the item name.');
+            return;
+          }
+          await setConvState(tenant.id, from, { step: 'awaiting_item_category', data: { name } });
+          await whatsapp.sendText(tenant, from, "🏷️ What's the category? (e.g. Dry Goods, Beverages)");
+          return;
+        }
+
+        if (convState && convState.step === 'awaiting_item_category') {
+          const category = message.text.body.trim();
+          if (!category) {
+            await whatsapp.sendText(tenant, from, 'Please provide the category.');
+            return;
+          }
+          await setConvState(tenant.id, from, { step: 'awaiting_item_stock', data: { ...convState.data, category } });
+          await whatsapp.sendText(tenant, from, "📦 What's the current stock quantity?");
+          return;
+        }
+
+        if (convState && convState.step === 'awaiting_item_stock') {
+          const rawStock = message.text.body.trim();
+          const currentStock = Number(rawStock);
+          if (rawStock === '' || Number.isNaN(currentStock) || currentStock < 0) {
+            await whatsapp.sendText(tenant, from, "That doesn't look like a valid quantity. Please reply with a non-negative number (e.g. 10 or 12.5).");
+            return;
+          }
+          await setConvState(tenant.id, from, { step: 'awaiting_item_minimum', data: { ...convState.data, currentStock } });
+          await whatsapp.sendText(tenant, from, "⚠️ What's the minimum stock level? (for low-stock alerts)");
+          return;
+        }
+
+        if (convState && convState.step === 'awaiting_item_minimum') {
+          const rawMinimum = message.text.body.trim();
+          const minimumStock = Number(rawMinimum);
+          if (rawMinimum === '' || Number.isNaN(minimumStock) || minimumStock < 0) {
+            await whatsapp.sendText(tenant, from, "That doesn't look like a valid quantity. Please reply with a non-negative number (e.g. 5 or 2.5).");
+            return;
+          }
+          await setConvState(tenant.id, from, { step: 'awaiting_item_unit', data: { ...convState.data, minimumStock } });
+          await whatsapp.sendText(tenant, from, "📏 What's the unit? (e.g. kg, pack, bottle)");
+          return;
+        }
+
+        if (convState && convState.step === 'awaiting_item_unit') {
+          const unit = message.text.body.trim();
+          if (!unit) {
+            await whatsapp.sendText(tenant, from, 'Please provide the unit.');
+            return;
+          }
+          await deleteConvState(tenant.id, from);
+          const { name, category, currentStock, minimumStock } = convState.data;
+          const result = await createInventoryItem(tenant.id, name, category, currentStock, minimumStock, unit);
+          if (!result) {
+            await whatsapp.sendText(tenant, from, '❌ Failed to add the new item. Please try again or contact support.');
+            return;
+          }
+          await whatsapp.sendText(
+            tenant,
+            from,
+            `✅ *Item Added*\n\n📦 ${name}\n🏷️ Category: ${category}\n📦 Stock: ${currentStock} ${unit}\n⚠️ Minimum: ${minimumStock} ${unit}`
+          );
+          return;
+        }
+
         // ── Add-document state machine (continued) ────────────────────
         // add_document → employee selection (list_reply, above) →
         // doc-type selection (button_reply, above) → these two text
@@ -831,6 +905,7 @@ router.post('/', async (req, res) => {
             await whatsapp.sendButtons(tenant, from, '📦 Inventory\n\nWhat would you like to do?', [
               { id: 'view_low_stock', title: '⚠️ View Low Stock' },
               { id: 'update_stock', title: '✏️ Update Stock' },
+              { id: 'add_item', title: '➕ Add Item' },
             ]);
             return;
           } else if (listId === 'foreign_worker_docs') {
@@ -997,11 +1072,11 @@ router.post('/', async (req, res) => {
         return;
       }
 
-      // view_low_stock/update_stock — same reasoning as view_team/
-      // add_staff above: this button_reply block is a separate code
-      // path from the list_reply branch's MANAGEMENT_ONLY_IDS gate, so
-      // the role check is repeated here rather than trusted implicitly.
-      if (buttonId === 'view_low_stock' || buttonId === 'update_stock') {
+      // view_low_stock/update_stock/add_item — same reasoning as
+      // view_team/add_staff above: this button_reply block is a separate
+      // code path from the list_reply branch's MANAGEMENT_ONLY_IDS gate,
+      // so the role check is repeated here rather than trusted implicitly.
+      if (buttonId === 'view_low_stock' || buttonId === 'update_stock' || buttonId === 'add_item') {
         const employee = await getEmployeeByPhone(tenant.id, from);
         if (!employee || !['owner', 'manager'].includes(employee.role)) {
           await whatsapp.sendText(tenant, from, '🔒 This section is only available to managers/owners. Contact your manager for details.');
@@ -1016,6 +1091,16 @@ router.post('/', async (req, res) => {
               ).join('\n')
             : '✅ All stock levels are healthy!';
           await whatsapp.sendText(tenant, from, reply);
+          return;
+        }
+
+        if (buttonId === 'add_item') {
+          // Deliberately checked before the update_stock block's "no
+          // items found" bail-out below — an empty inventory is exactly
+          // when adding the first item matters most, so add_item must
+          // never be blocked by that check.
+          await setConvState(tenant.id, from, { step: 'awaiting_item_name', data: {} });
+          await whatsapp.sendText(tenant, from, "What's the name of the new inventory item?");
           return;
         }
 
