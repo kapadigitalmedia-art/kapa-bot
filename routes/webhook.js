@@ -397,26 +397,12 @@ router.post('/', async (req, res) => {
         }
 
         // ── Leave application state machine ──────────────────────────
-        // apply_leave (button_reply, below) sets awaiting_leave_type to
-        // start this off. Each step re-prompts on invalid input rather
-        // than silently accepting garbage or falling through to the
-        // menu/check-in keyword checks further down.
-        if (convState && convState.step === 'awaiting_leave_type') {
-          const LEAVE_TYPE_MAP = {
-            '1': 'Annual Leave', 'annual': 'Annual Leave', 'annual leave': 'Annual Leave',
-            '2': 'Medical Leave', 'medical': 'Medical Leave', 'medical leave': 'Medical Leave',
-            '3': 'Emergency Leave', 'emergency': 'Emergency Leave', 'emergency leave': 'Emergency Leave',
-          };
-          const leaveType = LEAVE_TYPE_MAP[text];
-          if (!leaveType) {
-            await whatsapp.sendText(tenant, from, "Sorry, I didn't understand that. Please reply with 1, 2, or 3:\n\n1. Annual Leave\n2. Medical Leave\n3. Emergency Leave");
-            return;
-          }
-          await setConvState(tenant.id, from, { step: 'awaiting_leave_start', data: { leaveType } });
-          await whatsapp.sendText(tenant, from, '📅 What is your start date?\n\nFormat: YYYY-MM-DD or DD/MM/YYYY (e.g. 2026-08-01)');
-          return;
-        }
-
+        // One of the leave_type_* button_reply handlers (below) sets
+        // awaiting_leave_start to start this off — type selection is
+        // button-only, no text step/fallback (same as doc-type
+        // selection). Each remaining step re-prompts on invalid input
+        // rather than silently accepting garbage or falling through to
+        // the menu/check-in keyword checks further down.
         if (convState && convState.step === 'awaiting_leave_start') {
           const startDate = parseDateFlexible(message.text.body);
           if (!startDate) {
@@ -945,8 +931,21 @@ router.post('/', async (req, res) => {
       // checked ahead of the approve_/reject_ regexes, no collision
       // risk with that naming pattern.
       if (buttonId === 'apply_leave') {
-        await setConvState(tenant.id, from, { step: 'awaiting_leave_type', data: {} });
-        await whatsapp.sendText(tenant, from, 'What type of leave would you like to apply for?\n\n1. Annual Leave\n2. Medical Leave\n3. Emergency Leave\n\nReply with the type.');
+        await whatsapp.sendButtons(tenant, from, '📝 Apply for Leave\n\nWhat type of leave?', [
+          { id: 'leave_type_annual', title: '🏖️ Annual Leave' },
+          { id: 'leave_type_medical', title: '🏥 Medical Leave' },
+          { id: 'leave_type_emergency', title: '🚨 Emergency Leave' },
+        ]);
+        return;
+      }
+      if (buttonId === 'leave_type_annual' || buttonId === 'leave_type_medical' || buttonId === 'leave_type_emergency') {
+        const leaveType = {
+          leave_type_annual: 'Annual Leave',
+          leave_type_medical: 'Medical Leave',
+          leave_type_emergency: 'Emergency Leave',
+        }[buttonId];
+        await setConvState(tenant.id, from, { step: 'awaiting_leave_start', data: { leaveType } });
+        await whatsapp.sendText(tenant, from, '📅 What is your start date?\n\nFormat: YYYY-MM-DD or DD/MM/YYYY (e.g. 2026-08-01)');
         return;
       }
       if (buttonId === 'leave_history') {
