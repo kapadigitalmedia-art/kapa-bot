@@ -25,6 +25,10 @@ const {
   getMenuItems,
   createMenuItem,
   createOrder,
+  addOrderItem,
+  getOrderWithItems,
+  markOrderPaid,
+  markOrderCancelled,
   getEmployeeById,
   createForeignWorkerDocument,
   isPaymentGatewayConnected,
@@ -132,6 +136,22 @@ async function startOrderItemSelection(tenant, from, orderId) {
   }];
   await whatsapp.sendList(tenant, from, 'Select an item to add:', 'Choose Item', sections);
   await setConvState(tenant.id, from, { step: 'awaiting_order_item_selection', data: { orderId } });
+}
+
+/**
+ * Shared by every path that lands back at the "what next" decision —
+ * after an item is successfully added, and after tapping QR (which
+ * deliberately doesn't mark the order paid, so control returns here
+ * rather than ending the flow). Same "shared by both trigger paths"
+ * reasoning as startAttendanceFlow/startOrderItemSelection above.
+ */
+async function sendOrderNextActionPrompt(tenant, from, orderId) {
+  await setConvState(tenant.id, from, { step: 'awaiting_order_next_action', data: { orderId } });
+  await whatsapp.sendButtons(tenant, from, 'What would you like to do next?', [
+    { id: 'order_add_another', title: '➕ Add Another' },
+    { id: 'order_done_pay', title: '✅ Done, Pay' },
+    { id: 'order_cancel', title: '❌ Cancel Order' },
+  ]);
 }
 
 /**
@@ -738,6 +758,46 @@ router.post('/', async (req, res) => {
           return;
         }
 
+        // ── New-order state machine (item-quantity step) ─────────────────
+        // awaiting_order_item_selection (list_reply, below) sets this once
+        // an item is tapped, carrying orderId/menuItemId/itemName/
+        // unitPrice forward in conv-state.data.
+        if (convState && convState.step === 'awaiting_order_item_quantity') {
+          const rawQuantity = message.text.body.trim();
+          const quantity = Number(rawQuantity);
+          const isInvalidQuantity = rawQuantity === '' || !Number.isInteger(quantity) || quantity <= 0;
+
+          if (isInvalidQuantity && /[a-zA-Z]/.test(rawQuantity)) {
+            // Contains letters — not a plausible quantity attempt at all
+            // (e.g. they typed 'cancel' or 'menu' instead of a number).
+            // Same reasoning as awaiting_qr_amount's escape hatch: this
+            // step sits inside a loop someone may cycle through several
+            // times, unlike a short one-shot form, so trapping them
+            // behind "invalid quantity" no matter what they type is a
+            // real dead end here in a way it isn't for e.g.
+            // awaiting_item_stock. Clear the stale state and fall
+            // through to normal dispatch instead.
+            await deleteConvState(tenant.id, from);
+          } else if (isInvalidQuantity) {
+            // Still numeric-ish garbage ("0", "-2", "1.5", empty) — a
+            // genuine, if malformed, attempt at a quantity, so re-ask
+            // rather than bailing.
+            await whatsapp.sendText(tenant, from, "That doesn't look like a valid quantity. Please reply with a whole number (e.g. 2).");
+            return;
+          } else {
+            const { orderId, menuItemId, itemName, unitPrice } = convState.data;
+            const added = await addOrderItem(tenant.id, orderId, menuItemId, quantity, unitPrice);
+            if (!added) {
+              await deleteConvState(tenant.id, from);
+              await whatsapp.sendText(tenant, from, '❌ Failed to add that item. Please try again or contact support.');
+              return;
+            }
+            await whatsapp.sendText(tenant, from, `✅ Added ${itemName} x${quantity} to the order.`);
+            await sendOrderNextActionPrompt(tenant, from, orderId);
+            return;
+          }
+        }
+
         // ── Add-document state machine (continued) ────────────────────
         // add_document → employee selection (list_reply, above) →
         // doc-type selection (button_reply, above) → these two text
@@ -999,6 +1059,41 @@ router.post('/', async (req, res) => {
         await deleteConvState(tenant.id, from);
       }
 
+      // New Order's item-selection reply — same reasoning as
+      // stock-item-selection/doc-employee-selection above: 'order_item_<id>'
+      // ids are arbitrary, checked before DINE_MENU_IDS. No role check
+      // here (unlike the two blocks above) — new_order is deliberately
+      // ungated, so there's nothing to re-verify.
+      if (listReplyConvState && listReplyConvState.step === 'awaiting_order_item_selection') {
+        if (listId.startsWith('order_item_')) {
+          const itemId = listId.replace('order_item_', '');
+          // Re-fetched from this tenant's own menu, not trusted from the
+          // tapped id itself — the real name/price always come from this
+          // lookup. A forged or cross-tenant id simply won't be found
+          // here, same pattern as stock_item_selection's getInventory
+          // re-fetch above.
+          const items = await getMenuItems(tenant.id, true);
+          const selectedItem = items.find((i) => String(i.id) === itemId);
+          if (!selectedItem) {
+            await deleteConvState(tenant.id, from);
+            await whatsapp.sendText(tenant, from, "That item couldn't be found. Please start over with New Order.");
+            return;
+          }
+          const { orderId } = listReplyConvState.data;
+          await setConvState(tenant.id, from, {
+            step: 'awaiting_order_item_quantity',
+            data: { orderId, menuItemId: selectedItem.id, itemName: selectedItem.name, unitPrice: selectedItem.price },
+          });
+          await whatsapp.sendText(tenant, from, `How many ${selectedItem.name}?`);
+          return;
+        }
+        // Same reasoning as the stock-item-selection case above: a tap
+        // that isn't a real order_item_* selection means the user has
+        // moved on to something else — clear the stale state and fall
+        // through rather than silently dropping this tap.
+        await deleteConvState(tenant.id, from);
+      }
+
       // Only a resolved employee (real bot_employees row) could ever have
       // been sent sendDineMenu's list in the first place — a prospect
       // only ever sees the industry picker's 9 rows, which never collide
@@ -1214,6 +1309,96 @@ router.post('/', async (req, res) => {
         }
         await whatsapp.sendText(tenant, from, '🥡 Takeaway order started.');
         await startOrderItemSelection(tenant, from, order.id);
+        return;
+      }
+
+      // order_add_another/order_done_pay/order_cancel — only meaningful
+      // mid-flow, gated on the actual conv-state rather than just the
+      // button id, same reasoning as passport/visa/work_permit below: a
+      // stray tap with one of these ids outside awaiting_order_next_action
+      // is ignored rather than guessed at. Not gated to management
+      // either, same as the rest of the New Order flow.
+      if (buttonId === 'order_add_another' || buttonId === 'order_done_pay' || buttonId === 'order_cancel') {
+        const nextActionConvState = await getConvState(tenant.id, from);
+        if (!nextActionConvState || nextActionConvState.step !== 'awaiting_order_next_action') {
+          return;
+        }
+        const { orderId } = nextActionConvState.data;
+
+        if (buttonId === 'order_add_another') {
+          await startOrderItemSelection(tenant, from, orderId);
+          return;
+        }
+
+        if (buttonId === 'order_done_pay') {
+          await setConvState(tenant.id, from, { step: 'awaiting_order_payment_method', data: { orderId } });
+          await whatsapp.sendButtons(tenant, from, '💳 How is the customer paying?', [
+            { id: 'order_pay_cash', title: '💵 Cash' },
+            { id: 'order_pay_qr', title: '📱 QR' },
+          ]);
+          return;
+        }
+
+        // order_cancel
+        const cancelled = await markOrderCancelled(tenant.id, orderId);
+        await deleteConvState(tenant.id, from);
+        await whatsapp.sendText(
+          tenant,
+          from,
+          cancelled ? '❌ Order cancelled.' : "This order couldn't be cancelled — it may have already been paid or cancelled."
+        );
+        return;
+      }
+
+      // order_pay_cash/order_pay_qr — same reasoning as
+      // order_add_another/order_done_pay/order_cancel above: gated on
+      // the actual conv-state, ignored if reached outside
+      // awaiting_order_payment_method.
+      if (buttonId === 'order_pay_cash' || buttonId === 'order_pay_qr') {
+        const paymentConvState = await getConvState(tenant.id, from);
+        if (!paymentConvState || paymentConvState.step !== 'awaiting_order_payment_method') {
+          return;
+        }
+        const { orderId } = paymentConvState.data;
+
+        if (buttonId === 'order_pay_cash') {
+          await deleteConvState(tenant.id, from);
+          const paid = await markOrderPaid(tenant.id, orderId, 'cash');
+          await whatsapp.sendText(
+            tenant,
+            from,
+            paid ? '✅ Order marked as paid (cash). Thank you!' : "❌ Couldn't mark this order as paid. Please try again or contact support."
+          );
+          return;
+        }
+
+        // order_pay_qr — same honesty as the existing qr_code/
+        // awaiting_qr_amount flow above: never marks the order paid just
+        // because QR was tapped, since there's no real gateway
+        // confirmation behind it yet (bot_dine_sales has no writer,
+        // HitPay isn't wired up — see that flow's own comments). Shows
+        // the same demo QR and returns to awaiting_order_next_action
+        // (order stays 'open') via sendOrderNextActionPrompt, so they
+        // can still fall back to Cash, add more items, or cancel —
+        // never a dead end.
+        const order = await getOrderWithItems(tenant.id, orderId);
+        if (!order) {
+          await deleteConvState(tenant.id, from);
+          await whatsapp.sendText(tenant, from, "❌ Couldn't find this order. Please start over with New Order.");
+          return;
+        }
+        const amount = Number(order.total_amount);
+        await whatsapp.sendText(
+          tenant,
+          from,
+          `🚧 QR code payments aren't live yet — your HitPay connection is still being set up. We'll notify you once it's ready.\n\n💰 Amount: RM ${amount.toFixed(2)}`
+        );
+        const qrText = `KAPA ONE Dine - Demo Payment - RM${amount.toFixed(2)}`;
+        const token = createQrToken(qrText);
+        const baseUrl = process.env.PUBLIC_BASE_URL || 'https://kapa-bot-production.up.railway.app';
+        const imageUrl = `${baseUrl}/qr/${token}.png`;
+        await whatsapp.sendImage(tenant, from, imageUrl, `💳 Scan to demo - RM${amount.toFixed(2)}`);
+        await sendOrderNextActionPrompt(tenant, from, orderId);
         return;
       }
 
