@@ -1,5 +1,5 @@
-// Dine-specific main menu — a WhatsApp LIST message (not buttons; 5
-// rows and buttons cap at 3).
+// Dine-specific main menu — a WhatsApp LIST message (not buttons; a
+// list section caps at 10 rows, buttons cap at 3).
 //
 // Same 5 rows for every employee regardless of role — a deliberate
 // simplification over the earlier owner-vs-staff split (owner saw
@@ -62,6 +62,7 @@ async function sendDineMenu(tenant, to, employee) {
     { id: 'foreign_worker_docs', title: '📄 Foreign Worker Docs', description: 'Passport/visa/permit expiry status' },
     { id: 'staff', title: '👥 Staff', description: 'View your team' },
     { id: 'qr_code', title: '💰 QR Code', description: 'Generate a payment QR code' },
+    { id: 'menu_mgmt', title: '🍽️ Menu Management', description: 'View or add menu items' },
   ];
 
   const sections = [{ title: 'Menu', rows }];

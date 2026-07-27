@@ -22,6 +22,8 @@ const {
   getInventory,
   updateInventoryStock,
   createInventoryItem,
+  getMenuItems,
+  createMenuItem,
   getEmployeeById,
   createForeignWorkerDocument,
   isPaymentGatewayConnected,
@@ -628,6 +630,56 @@ router.post('/', async (req, res) => {
           return;
         }
 
+        // ── Add-menu-item state machine ─────────────────────────────────
+        // add_menu_item (button_reply, below) sets awaiting_menu_item_name
+        // to start this off. Only ever reachable by someone who already
+        // passed the owner/manager check in that handler — same
+        // reasoning as add_staff/add_item above, this sequence doesn't
+        // re-check role at each step.
+        if (convState && convState.step === 'awaiting_menu_item_name') {
+          const name = message.text.body.trim();
+          if (!name) {
+            await whatsapp.sendText(tenant, from, 'Please provide the menu item name.');
+            return;
+          }
+          await setConvState(tenant.id, from, { step: 'awaiting_menu_item_category', data: { name } });
+          await whatsapp.sendText(tenant, from, "🏷️ What's the category? (e.g. Rice Dishes, Beverages)");
+          return;
+        }
+
+        if (convState && convState.step === 'awaiting_menu_item_category') {
+          const category = message.text.body.trim();
+          if (!category) {
+            await whatsapp.sendText(tenant, from, 'Please provide the category.');
+            return;
+          }
+          await setConvState(tenant.id, from, { step: 'awaiting_menu_item_price', data: { ...convState.data, category } });
+          await whatsapp.sendText(tenant, from, "💰 What's the price? (e.g. 8.50)");
+          return;
+        }
+
+        if (convState && convState.step === 'awaiting_menu_item_price') {
+          const rawPrice = message.text.body.trim();
+          const price = Number(rawPrice);
+          if (rawPrice === '' || Number.isNaN(price) || price <= 0) {
+            await whatsapp.sendText(tenant, from, "That doesn't look like a valid price. Please reply with a positive number (e.g. 8.50).");
+            return;
+          }
+          await deleteConvState(tenant.id, from);
+          const { name, category } = convState.data;
+          const result = await createMenuItem(tenant.id, name, category, price);
+          if (!result) {
+            await whatsapp.sendText(tenant, from, '❌ Failed to add the new menu item. Please try again or contact support.');
+            return;
+          }
+          await whatsapp.sendText(
+            tenant,
+            from,
+            `✅ *Menu Item Added*\n\n🍽️ ${name}\n🏷️ Category: ${category}\n💰 Price: RM${price.toFixed(2)}`
+          );
+          return;
+        }
+
         // ── Add-document state machine (continued) ────────────────────
         // add_document → employee selection (list_reply, above) →
         // doc-type selection (button_reply, above) → these two text
@@ -895,7 +947,7 @@ router.post('/', async (req, res) => {
       // with these ids. Checked here (not gated on industrySlug === 'dine'
       // again) because by this point all that matters is "did this ID
       // come from our own Dine menu", not which industry the tenant is.
-      const DINE_MENU_IDS = ['dashboard', 'inventory', 'staff', 'leave', 'foreign_worker_docs', 'checkin', 'my_records', 'qr_code'];
+      const DINE_MENU_IDS = ['dashboard', 'inventory', 'staff', 'leave', 'foreign_worker_docs', 'checkin', 'my_records', 'qr_code', 'menu_mgmt'];
       // inventory/foreign_worker_docs/staff all surface tenant-wide data
       // (every employee's low stock, every employee's expiring
       // documents, the full staff directory) — gated to management
@@ -907,7 +959,7 @@ router.post('/', async (req, res) => {
       // levels and the team roster without being the tenant's owner,
       // same 'manager' role already used elsewhere in this codebase
       // (kapa/Asia Avid's own seeded employees).
-      const MANAGEMENT_ONLY_IDS = ['inventory', 'foreign_worker_docs', 'staff', 'qr_code'];
+      const MANAGEMENT_ONLY_IDS = ['inventory', 'foreign_worker_docs', 'staff', 'qr_code', 'menu_mgmt'];
       if (DINE_MENU_IDS.includes(listId)) {
         if (employee) {
           let reply;
@@ -966,6 +1018,21 @@ router.post('/', async (req, res) => {
             // amount, not a choice between two.
             await setConvState(tenant.id, from, { step: 'awaiting_qr_amount', data: {} });
             await whatsapp.sendText(tenant, from, "💰 What's the amount to charge? (e.g. 45.50)");
+            return;
+          } else if (listId === 'menu_mgmt') {
+            // Already gated to owner/manager by the MANAGEMENT_ONLY_IDS
+            // check above — this branch runs in the same synchronous
+            // dispatch as that check, off the same `employee` value, so
+            // there's nothing new to re-verify here. (The check IS
+            // repeated below, at view_menu/add_menu_item's button_reply
+            // handler — those are separate invocations reachable
+            // independently of this list_reply dispatch, the same reason
+            // view_low_stock/add_item and view_team/add_staff repeat it
+            // there instead of here.)
+            await whatsapp.sendButtons(tenant, from, '🍽️ Menu Management\n\nWhat would you like to do?', [
+              { id: 'view_menu', title: '📋 View Menu' },
+              { id: 'add_menu_item', title: '➕ Add Item' },
+            ]);
             return;
           } else {
             // dashboard/my_records — neither has a real WhatsApp-native
@@ -1184,6 +1251,53 @@ router.post('/', async (req, res) => {
         }];
         await whatsapp.sendList(tenant, from, '➕ Add Document\n\nSelect the employee:', 'Choose Employee', sections);
         await setConvState(tenant.id, from, { step: 'awaiting_doc_employee_selection', data: {} });
+        return;
+      }
+
+      // view_menu/add_menu_item — same reasoning as view_low_stock/
+      // update_stock/view_team/add_staff/view_expiring_docs/add_document
+      // above: a separate code path from list_reply's MANAGEMENT_ONLY_IDS
+      // gate, so the role check is repeated here rather than trusted
+      // implicitly.
+      if (buttonId === 'view_menu' || buttonId === 'add_menu_item') {
+        const employee = await getEmployeeByPhone(tenant.id, from);
+        if (!employee || !['owner', 'manager'].includes(employee.role)) {
+          await whatsapp.sendText(tenant, from, '🔒 This section is only available to managers/owners. Contact your manager for details.');
+          return;
+        }
+
+        if (buttonId === 'view_menu') {
+          // ALL items, not just available ones — this is for management
+          // review, not the customer-facing menu, so 86'd items still
+          // need to show up (with their status), unlike a hypothetical
+          // customer ordering flow which would filter to available-only.
+          const items = await getMenuItems(tenant.id, false);
+          if (!items.length) {
+            await whatsapp.sendText(tenant, from, 'No menu items found. Add one via Add Item.');
+            return;
+          }
+          const byCategory = {};
+          for (const item of items) {
+            const cat = item.category || 'Uncategorized';
+            if (!byCategory[cat]) byCategory[cat] = [];
+            byCategory[cat].push(item);
+          }
+          const sections = Object.keys(byCategory)
+            .sort()
+            .map((cat) => {
+              const lines = byCategory[cat]
+                .map((item) => `• ${item.name} — RM${Number(item.price).toFixed(2)} ${item.is_available ? '✅' : '🚫 Unavailable'}`)
+                .join('\n');
+              return `*${cat}*\n${lines}`;
+            });
+          const reply = '🍽️ *Menu*\n\n' + sections.join('\n\n');
+          await whatsapp.sendText(tenant, from, reply);
+          return;
+        }
+
+        // add_menu_item
+        await setConvState(tenant.id, from, { step: 'awaiting_menu_item_name', data: {} });
+        await whatsapp.sendText(tenant, from, "What's the name of the new menu item?");
         return;
       }
 
