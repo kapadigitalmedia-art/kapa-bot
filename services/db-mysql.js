@@ -1601,6 +1601,52 @@ async function markOrderCancelled(tenantId, orderId) {
 }
 
 /**
+ * Recent orders with their line items, for the Hub dashboard's GET
+ * /orders — a tenant-wide equivalent of getOrderWithItems rather than
+ * calling it once per order. Two queries total regardless of how many
+ * orders are returned: the orders themselves (LIMIT-ed, same 50-row
+ * default as getRecentAttendanceForTenant), then every line item
+ * across all of them in one WHERE order_id IN (...) query, grouped in
+ * JS. Calling getOrderWithItems in a loop here would mean up to 2x
+ * `limit` separate round-trips for something the dashboard loads on
+ * every page view — worth the extra grouping step to avoid.
+ */
+async function getRecentOrdersWithItems(tenantId, limit = 50) {
+  const [orders] = await pool.query(
+    'SELECT * FROM bot_dine_orders WHERE tenant_id = ? ORDER BY created_at DESC LIMIT ?',
+    [tenantId, limit]
+  );
+  if (!orders.length) {
+    return [];
+  }
+
+  const orderIds = orders.map((o) => o.id);
+  const [itemRows] = await pool.query(
+    `SELECT oi.order_id, mi.name, oi.quantity, oi.unit_price
+     FROM bot_dine_order_items oi
+     JOIN bot_dine_menu_items mi ON mi.id = oi.menu_item_id
+     WHERE oi.order_id IN (?)`,
+    [orderIds]
+  );
+
+  const itemsByOrderId = {};
+  for (const row of itemRows) {
+    if (!itemsByOrderId[row.order_id]) itemsByOrderId[row.order_id] = [];
+    itemsByOrderId[row.order_id].push({
+      name: row.name,
+      quantity: row.quantity,
+      unitPrice: row.unit_price,
+      lineTotal: row.quantity * row.unit_price,
+    });
+  }
+
+  return orders.map((order) => ({
+    ...order,
+    items: itemsByOrderId[order.id] || [],
+  }));
+}
+
+/**
  * Foreign worker documents (bot_foreign_worker_documents, migration
  * 026) — status is deliberately NOT a stored column (see that
  * migration's header comment for the full reasoning: bot_trial_signups'
@@ -1937,6 +1983,7 @@ module.exports = {
   getOrderWithItems,
   markOrderPaid,
   markOrderCancelled,
+  getRecentOrdersWithItems,
   createForeignWorkerDocument,
   getForeignWorkerDocuments,
   getExpiringDocuments,

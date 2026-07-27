@@ -17,6 +17,7 @@ const {
   getEmployeesForTenant,
   getEmployeeWithTenantName,
   getEmployeeById,
+  getRecentOrdersWithItems,
   upsertPaymentGateway,
   isPaymentGatewayConnected,
 } = require('../services/db-mysql');
@@ -197,6 +198,20 @@ router.get('/staff', requireHubAuth, async (req, res) => {
     return res.json({ ok: true, employees });
   } catch (err) {
     logger.error('Hub GET /staff error:', err);
+    return res.status(500).json({ ok: false, error: 'Internal server error' });
+  }
+});
+
+// Open to any authenticated employee, same as /inventory/attendance/
+// leave/staff above — not management-only. Seeing recent orders is
+// useful for any frontline staff member, same reasoning new_order
+// itself is ungated in the WhatsApp flow.
+router.get('/orders', requireHubAuth, async (req, res) => {
+  try {
+    const orders = await getRecentOrdersWithItems(req.tenant_id);
+    return res.json({ ok: true, orders });
+  } catch (err) {
+    logger.error('Hub GET /orders error:', err);
     return res.status(500).json({ ok: false, error: 'Internal server error' });
   }
 });
