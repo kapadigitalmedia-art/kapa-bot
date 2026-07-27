@@ -1452,6 +1452,47 @@ async function getLowStockItems(tenantId) {
   return rows;
 }
 
+async function createMenuItem(tenantId, name, category, price) {
+  const [result] = await pool.execute(
+    'INSERT INTO bot_dine_menu_items (tenant_id, name, category, price) VALUES (?, ?, ?, ?)',
+    [tenantId, name, category ?? null, price]
+  );
+  const insertId = result.insertId;
+
+  // Same defensive check applied to every other create* function in
+  // this file — a truthy-but-invalid insertId (e.g. 0) would otherwise
+  // report success for a row that was never actually written.
+  if (insertId === null || insertId === undefined) {
+    return null;
+  }
+
+  return { id: insertId };
+}
+
+async function getMenuItems(tenantId, availableOnly = false) {
+  const sql = availableOnly
+    ? 'SELECT * FROM bot_dine_menu_items WHERE tenant_id = ? AND is_available = TRUE ORDER BY category, name'
+    : 'SELECT * FROM bot_dine_menu_items WHERE tenant_id = ? ORDER BY category, name';
+  const [rows] = await pool.query(sql, [tenantId]);
+  return rows;
+}
+
+async function updateMenuItemAvailability(tenantId, itemId, isAvailable) {
+  const [result] = await pool.execute(
+    'UPDATE bot_dine_menu_items SET is_available = ? WHERE id = ? AND tenant_id = ?',
+    [isAvailable, itemId, tenantId]
+  );
+  return result.affectedRows > 0;
+}
+
+async function updateMenuItemPrice(tenantId, itemId, newPrice) {
+  const [result] = await pool.execute(
+    'UPDATE bot_dine_menu_items SET price = ? WHERE id = ? AND tenant_id = ?',
+    [newPrice, itemId, tenantId]
+  );
+  return result.affectedRows > 0;
+}
+
 /**
  * Foreign worker documents (bot_foreign_worker_documents, migration
  * 026) — status is deliberately NOT a stored column (see that
@@ -1780,6 +1821,10 @@ module.exports = {
   updateInventoryStock,
   getInventory,
   getLowStockItems,
+  createMenuItem,
+  getMenuItems,
+  updateMenuItemAvailability,
+  updateMenuItemPrice,
   createForeignWorkerDocument,
   getForeignWorkerDocuments,
   getExpiringDocuments,
