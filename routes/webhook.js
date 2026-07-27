@@ -24,6 +24,7 @@ const {
   createInventoryItem,
   getMenuItems,
   createMenuItem,
+  createOrder,
   getEmployeeById,
   createForeignWorkerDocument,
   isPaymentGatewayConnected,
@@ -103,6 +104,34 @@ async function startAttendanceFlow(tenant, from, type) {
   await setConvState(tenant.id, from, { step: 'awaiting_location', data: { type } });
   const label = type === 'in' ? 'check-in' : 'check-out';
   await whatsapp.requestLocation(tenant, from, `📍 Please share your location to confirm ${label}.`);
+}
+
+/**
+ * Shared by both order-type triggers — takeaway (immediate, no table
+ * number needed) and dine-in (after a table number is collected first)
+ * — once a real bot_dine_orders row exists, showing the item picker
+ * and moving into awaiting_order_item_selection is identical either
+ * way. Same "shared by both trigger paths" reasoning as
+ * startAttendanceFlow above.
+ */
+async function startOrderItemSelection(tenant, from, orderId) {
+  const items = await getMenuItems(tenant.id, true);
+  if (!items.length) {
+    await whatsapp.sendText(tenant, from, 'No menu items available yet. Add items via Menu Management first.');
+    return;
+  }
+  // Same 10-row WhatsApp list cap as Update Stock/Add Document's item
+  // lists — flagged there, not repeated in full here.
+  const sections = [{
+    title: 'Menu Items',
+    rows: items.slice(0, 10).map((item) => ({
+      id: `order_item_${item.id}`,
+      title: item.name,
+      description: item.category ? `${item.category} — RM${Number(item.price).toFixed(2)}` : `RM${Number(item.price).toFixed(2)}`,
+    })),
+  }];
+  await whatsapp.sendList(tenant, from, 'Select an item to add:', 'Choose Item', sections);
+  await setConvState(tenant.id, from, { step: 'awaiting_order_item_selection', data: { orderId } });
 }
 
 /**
@@ -680,6 +709,35 @@ router.post('/', async (req, res) => {
           return;
         }
 
+        // ── New-order state machine (dine-in table-number step) ──────────
+        // order_dine_in (button_reply, below) sets awaiting_order_table to
+        // start this off. Not gated to management (new_order isn't in
+        // MANAGEMENT_ONLY_IDS at all) — any resolved employee reaching
+        // this point is legitimately taking an order, same reasoning as
+        // checkin/leave staying open to everyone.
+        if (convState && convState.step === 'awaiting_order_table') {
+          const tableNumber = message.text.body.trim();
+          if (!tableNumber) {
+            await whatsapp.sendText(tenant, from, 'Please provide a table number.');
+            return;
+          }
+          const employee = await getEmployeeByPhone(tenant.id, from);
+          if (!employee) {
+            await deleteConvState(tenant.id, from);
+            await whatsapp.sendText(tenant, from, "We couldn't find your employee record. Please contact your admin.");
+            return;
+          }
+          await deleteConvState(tenant.id, from);
+          const order = await createOrder(tenant.id, 'dine_in', tableNumber, employee.id);
+          if (!order) {
+            await whatsapp.sendText(tenant, from, '❌ Failed to start the order. Please try again or contact support.');
+            return;
+          }
+          await whatsapp.sendText(tenant, from, `🍽️ Dine-in order started for Table ${tableNumber}.`);
+          await startOrderItemSelection(tenant, from, order.id);
+          return;
+        }
+
         // ── Add-document state machine (continued) ────────────────────
         // add_document → employee selection (list_reply, above) →
         // doc-type selection (button_reply, above) → these two text
@@ -947,7 +1005,7 @@ router.post('/', async (req, res) => {
       // with these ids. Checked here (not gated on industrySlug === 'dine'
       // again) because by this point all that matters is "did this ID
       // come from our own Dine menu", not which industry the tenant is.
-      const DINE_MENU_IDS = ['dashboard', 'inventory', 'staff', 'leave', 'foreign_worker_docs', 'checkin', 'my_records', 'qr_code', 'menu_mgmt'];
+      const DINE_MENU_IDS = ['dashboard', 'inventory', 'staff', 'leave', 'foreign_worker_docs', 'checkin', 'my_records', 'qr_code', 'menu_mgmt', 'new_order'];
       // inventory/foreign_worker_docs/staff all surface tenant-wide data
       // (every employee's low stock, every employee's expiring
       // documents, the full staff directory) — gated to management
@@ -991,6 +1049,17 @@ router.post('/', async (req, res) => {
             await whatsapp.sendButtons(tenant, from, '📋 Attendance\n\nWhat would you like to do?', [
               { id: 'checkin', title: '✅ Check In' },
               { id: 'checkout', title: '🚪 Check Out' },
+            ]);
+            return;
+          } else if (listId === 'new_order') {
+            // Not gated to management — new_order is deliberately absent
+            // from MANAGEMENT_ONLY_IDS, unlike inventory/staff/docs/
+            // qr_code/menu_mgmt. Taking an order is a frontline task any
+            // resolved employee should be able to do, same reasoning as
+            // checkin/leave above.
+            await whatsapp.sendButtons(tenant, from, '🛒 New Order\n\nWhat type of order?', [
+              { id: 'order_dine_in', title: '🍽️ Dine In' },
+              { id: 'order_takeaway', title: '🥡 Takeaway' },
             ]);
             return;
           } else if (listId === 'leave') {
@@ -1118,6 +1187,33 @@ router.post('/', async (req, res) => {
             ).join('\n')
           : "You haven't submitted any leave requests yet.";
         await whatsapp.sendText(tenant, from, reply);
+        return;
+      }
+
+      // order_dine_in/order_takeaway — not gated to management, same as
+      // checkin/leave_history above and new_order's own list_reply entry
+      // point: no role re-check needed here, unlike view_team/add_staff
+      // etc. below, since this whole flow is intentionally open to any
+      // resolved employee.
+      if (buttonId === 'order_dine_in') {
+        await setConvState(tenant.id, from, { step: 'awaiting_order_table', data: {} });
+        await whatsapp.sendText(tenant, from, '🔢 What table number?');
+        return;
+      }
+
+      if (buttonId === 'order_takeaway') {
+        const employee = await getEmployeeByPhone(tenant.id, from);
+        if (!employee) {
+          await whatsapp.sendText(tenant, from, "We couldn't find your employee record. Please contact your admin.");
+          return;
+        }
+        const order = await createOrder(tenant.id, 'takeaway', null, employee.id);
+        if (!order) {
+          await whatsapp.sendText(tenant, from, '❌ Failed to start the order. Please try again or contact support.');
+          return;
+        }
+        await whatsapp.sendText(tenant, from, '🥡 Takeaway order started.');
+        await startOrderItemSelection(tenant, from, order.id);
         return;
       }
 

@@ -1589,6 +1589,17 @@ async function markOrderPaid(tenantId, orderId, paymentMethod) {
   return result.affectedRows > 0;
 }
 
+// status = 'open' in the WHERE clause, not just id/tenant_id — an
+// already-paid order must stay paid; cancelling it after the fact
+// would silently erase real settled revenue, not void a pending one.
+async function markOrderCancelled(tenantId, orderId) {
+  const [result] = await pool.execute(
+    "UPDATE bot_dine_orders SET status = 'cancelled' WHERE id = ? AND tenant_id = ? AND status = 'open'",
+    [orderId, tenantId]
+  );
+  return result.affectedRows > 0;
+}
+
 /**
  * Foreign worker documents (bot_foreign_worker_documents, migration
  * 026) — status is deliberately NOT a stored column (see that
@@ -1925,6 +1936,7 @@ module.exports = {
   addOrderItem,
   getOrderWithItems,
   markOrderPaid,
+  markOrderCancelled,
   createForeignWorkerDocument,
   getForeignWorkerDocuments,
   getExpiringDocuments,

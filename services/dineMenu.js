@@ -57,6 +57,7 @@ async function sendDineMenu(tenant, to, employee) {
 
   const rows = [
     { id: 'checkin', title: '✅ Attendance', description: 'Check in / check out' },
+    { id: 'new_order', title: '🛒 New Order', description: 'Take a dine-in or takeaway order' },
     { id: 'leave', title: '🌴 Leave', description: 'Apply or view leave requests' },
     { id: 'inventory', title: '📦 Inventory', description: 'Check stock levels & low-stock alerts' },
     { id: 'foreign_worker_docs', title: '📄 Foreign Worker Docs', description: 'Passport/visa/permit expiry status' },
