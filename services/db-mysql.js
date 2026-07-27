@@ -1499,6 +1499,96 @@ async function updateMenuItemPrice(tenantId, itemId, newPrice) {
   return result.affectedRows > 0;
 }
 
+async function createOrder(tenantId, orderType, tableNumber, employeeId) {
+  const [result] = await pool.execute(
+    `INSERT INTO bot_dine_orders (tenant_id, order_type, table_number, status, total_amount, created_by_employee_id)
+     VALUES (?, ?, ?, 'open', 0, ?)`,
+    [tenantId, orderType, tableNumber ?? null, employeeId ?? null]
+  );
+  const insertId = result.insertId;
+
+  // Same defensive check applied to every other create* function in
+  // this file — a truthy-but-invalid insertId (e.g. 0) would otherwise
+  // report success for a row that was never actually written.
+  if (insertId === null || insertId === undefined) {
+    return null;
+  }
+
+  return { id: insertId };
+}
+
+/**
+ * bot_dine_order_items carries no tenant_id column of its own (see
+ * migration 031 — reached only via order_id, same as
+ * bot_task_assignments' relationship to bot_tasks), so tenant
+ * isolation for the INSERT below can't be expressed as a WHERE clause
+ * on that statement the way every other write in this file manages it.
+ * Checked explicitly up front instead: without this, a cross-tenant
+ * orderId would still succeed at inserting a line item onto another
+ * tenant's order — the total_amount UPDATE's own tenant_id check would
+ * catch the mismatch and report failure, but only AFTER the orphaned
+ * item had already been written.
+ */
+async function addOrderItem(tenantId, orderId, menuItemId, quantity, unitPrice) {
+  const [orderRows] = await pool.query(
+    'SELECT id FROM bot_dine_orders WHERE id = ? AND tenant_id = ?',
+    [orderId, tenantId]
+  );
+  if (orderRows.length === 0) {
+    return false;
+  }
+
+  const [itemResult] = await pool.execute(
+    'INSERT INTO bot_dine_order_items (order_id, menu_item_id, quantity, unit_price) VALUES (?, ?, ?, ?)',
+    [orderId, menuItemId, quantity, unitPrice]
+  );
+  if (itemResult.insertId === null || itemResult.insertId === undefined) {
+    return false;
+  }
+
+  const [orderUpdateResult] = await pool.execute(
+    'UPDATE bot_dine_orders SET total_amount = total_amount + (? * ?) WHERE id = ? AND tenant_id = ?',
+    [quantity, unitPrice, orderId, tenantId]
+  );
+  return orderUpdateResult.affectedRows > 0;
+}
+
+async function getOrderWithItems(tenantId, orderId) {
+  const [orderRows] = await pool.query(
+    'SELECT * FROM bot_dine_orders WHERE id = ? AND tenant_id = ?',
+    [orderId, tenantId]
+  );
+  if (orderRows.length === 0) {
+    return null;
+  }
+
+  const [itemRows] = await pool.query(
+    `SELECT mi.name, oi.quantity, oi.unit_price
+     FROM bot_dine_order_items oi
+     JOIN bot_dine_menu_items mi ON mi.id = oi.menu_item_id
+     WHERE oi.order_id = ?`,
+    [orderId]
+  );
+
+  return {
+    ...orderRows[0],
+    items: itemRows.map((row) => ({
+      name: row.name,
+      quantity: row.quantity,
+      unitPrice: row.unit_price,
+      lineTotal: row.quantity * row.unit_price,
+    })),
+  };
+}
+
+async function markOrderPaid(tenantId, orderId, paymentMethod) {
+  const [result] = await pool.execute(
+    "UPDATE bot_dine_orders SET status = 'paid', payment_method = ?, paid_at = NOW() WHERE id = ? AND tenant_id = ?",
+    [paymentMethod, orderId, tenantId]
+  );
+  return result.affectedRows > 0;
+}
+
 /**
  * Foreign worker documents (bot_foreign_worker_documents, migration
  * 026) — status is deliberately NOT a stored column (see that
@@ -1831,6 +1921,10 @@ module.exports = {
   getMenuItems,
   updateMenuItemAvailability,
   updateMenuItemPrice,
+  createOrder,
+  addOrderItem,
+  getOrderWithItems,
+  markOrderPaid,
   createForeignWorkerDocument,
   getForeignWorkerDocuments,
   getExpiringDocuments,
