@@ -46,9 +46,7 @@ const app = express();
 // via a real OPTIONS request from a browser-realistic Origin before it
 // could silently block every dashboard fetch past login (login itself
 // has no Authorization header, so it alone would have looked fine).
-// TEMP - http://localhost:8080 added for local kapa-hub.html testing,
-// remove before final deploy once testing is done.
-const ALLOWED_ORIGINS = ['https://www.kapa.my', 'https://admin.kapa.my', 'http://localhost:8080'];
+const ALLOWED_ORIGINS = ['https://www.kapa.my', 'https://admin.kapa.my'];
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (ALLOWED_ORIGINS.includes(origin)) {
