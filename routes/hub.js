@@ -139,7 +139,7 @@ router.get('/me', requireHubAuth, async (req, res) => {
     if (!me) {
       return res.status(404).json({ ok: false, error: 'Not found' });
     }
-    return res.json({ ok: true, full_name: me.full_name, role: me.role, tenant_name: me.tenant_name });
+    return res.json({ ok: true, full_name: me.full_name, role: me.role, tenant_name: me.tenant_name, industry_slug: me.industry_slug });
   } catch (err) {
     logger.error('Hub GET /me error:', err);
     return res.status(500).json({ ok: false, error: 'Internal server error' });

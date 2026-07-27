@@ -1127,12 +1127,18 @@ async function getEmployeeById(tenantId, employeeId) {
  * business name has to come from bot_tenants via this join, same
  * reasoning as getTenantNameById but returning the employee's own
  * full_name/role alongside it in one query rather than two.
+ *
+ * bot_trial_signups is LEFT JOINed, not INNER — not every tenant has a
+ * trial-signup row (e.g. 'kapa' itself, a real business tenant with no
+ * trial lifecycle at all), and an INNER join would silently return NO
+ * row at all for those, not just a null industry_slug.
  */
 async function getEmployeeWithTenantName(tenantId, employeeId) {
   const [rows] = await pool.query(
-    `SELECT e.full_name, e.role, t.tenant_name
+    `SELECT e.full_name, e.role, t.tenant_name, bts.industry_slug
      FROM bot_employees e
      JOIN bot_tenants t ON e.tenant_id = t.tenant_id
+     LEFT JOIN bot_trial_signups bts ON bts.tenant_id = e.tenant_id
      WHERE e.id = ? AND e.tenant_id = ?`,
     [employeeId, tenantId]
   );
