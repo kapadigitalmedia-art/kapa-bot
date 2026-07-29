@@ -458,31 +458,45 @@ router.post('/', async (req, res) => {
         if (convState && convState.step === 'awaiting_leave_start') {
           const startDate = parseDateFlexible(message.text.body);
           if (!startDate) {
-            await whatsapp.sendText(tenant, from, "That doesn't look like a valid date. Please reply with your start date in YYYY-MM-DD or DD/MM/YYYY format.");
+            if (/[a-zA-Z]/.test(message.text.body.trim())) {
+              // Not a plausible date attempt at all (e.g. 'cancel', 'menu') —
+              // same escape hatch as awaiting_order_item_quantity/
+              // awaiting_qr_amount: clear the stale state and fall through
+              // to normal dispatch instead of trapping them behind "invalid
+              // date" no matter what they type.
+              await deleteConvState(tenant.id, from);
+            } else {
+              await whatsapp.sendText(tenant, from, "That doesn't look like a valid date. Please reply with your start date in YYYY-MM-DD or DD/MM/YYYY format.");
+              return;
+            }
+          } else {
+            await setConvState(tenant.id, from, { step: 'awaiting_leave_end', data: { ...convState.data, startDate } });
+            await whatsapp.sendText(tenant, from, '📅 What is your end date?\n\nFormat: YYYY-MM-DD or DD/MM/YYYY');
             return;
           }
-          await setConvState(tenant.id, from, { step: 'awaiting_leave_end', data: { ...convState.data, startDate } });
-          await whatsapp.sendText(tenant, from, '📅 What is your end date?\n\nFormat: YYYY-MM-DD or DD/MM/YYYY');
-          return;
         }
 
         if (convState && convState.step === 'awaiting_leave_end') {
           const endDate = parseDateFlexible(message.text.body);
           if (!endDate) {
-            await whatsapp.sendText(tenant, from, "That doesn't look like a valid date. Please reply with your end date in YYYY-MM-DD or DD/MM/YYYY format.");
-            return;
-          }
-          // Plain string comparison is safe here — both sides are
-          // zero-padded 'YYYY-MM-DD', so lexicographic order matches
-          // chronological order exactly.
-          if (endDate < convState.data.startDate) {
+            if (/[a-zA-Z]/.test(message.text.body.trim())) {
+              await deleteConvState(tenant.id, from);
+            } else {
+              await whatsapp.sendText(tenant, from, "That doesn't look like a valid date. Please reply with your end date in YYYY-MM-DD or DD/MM/YYYY format.");
+              return;
+            }
+          } else if (endDate < convState.data.startDate) {
+            // Plain string comparison is safe here — both sides are
+            // zero-padded 'YYYY-MM-DD', so lexicographic order matches
+            // chronological order exactly.
             await whatsapp.sendText(tenant, from, `Your end date can't be before your start date (${convState.data.startDate}). Please reply with a valid end date.`);
             return;
+          } else {
+            const totalDays = daysBetweenInclusive(convState.data.startDate, endDate);
+            await setConvState(tenant.id, from, { step: 'awaiting_leave_reason', data: { ...convState.data, endDate, totalDays } });
+            await whatsapp.sendText(tenant, from, '📝 Please provide a reason for your leave:');
+            return;
           }
-          const totalDays = daysBetweenInclusive(convState.data.startDate, endDate);
-          await setConvState(tenant.id, from, { step: 'awaiting_leave_reason', data: { ...convState.data, endDate, totalDays } });
-          await whatsapp.sendText(tenant, from, '📝 Please provide a reason for your leave:');
-          return;
         }
 
         if (convState && convState.step === 'awaiting_leave_reason') {
@@ -527,25 +541,34 @@ router.post('/', async (req, res) => {
         if (convState && convState.step === 'awaiting_staff_number') {
           const rawNumber = message.text.body.trim();
           if (!looksLikePhoneNumber(rawNumber)) {
-            await whatsapp.sendText(tenant, from, "That doesn't look like a valid WhatsApp number. Please reply with the number including country code (e.g. 60123456789).");
+            if (/[a-zA-Z]/.test(rawNumber)) {
+              // Not a plausible phone-number attempt at all — same escape
+              // hatch as the other numeric/date steps below: clear the
+              // stale state and fall through instead of trapping them
+              // behind "invalid number" no matter what they type.
+              await deleteConvState(tenant.id, from);
+            } else {
+              await whatsapp.sendText(tenant, from, "That doesn't look like a valid WhatsApp number. Please reply with the number including country code (e.g. 60123456789).");
+              return;
+            }
+          } else {
+            // Cross-tenant, not just this tenant — whatsapp_number is only
+            // unique per-tenant (uq_tenant_whatsapp), so a number already
+            // used by an employee in a DIFFERENT tenant would otherwise
+            // create the exact ambiguous-employee collision
+            // tenantResolution.js already has to silently drop messages
+            // for (services/tenantResolution.js, 'ambiguous_employee').
+            // Checked here, before creation, rather than discovered after
+            // the fact.
+            const existing = await getEmployeeByPhoneAnyTenant(rawNumber);
+            if (existing.length > 0) {
+              await whatsapp.sendText(tenant, from, 'This number is already registered to an employee. Please provide a different WhatsApp number.');
+              return;
+            }
+            await setConvState(tenant.id, from, { step: 'awaiting_staff_role', data: { ...convState.data, whatsappNumber: rawNumber } });
+            await whatsapp.sendText(tenant, from, "🏷️ What's their role? (e.g. Waiter, Chef, Manager)");
             return;
           }
-          // Cross-tenant, not just this tenant — whatsapp_number is only
-          // unique per-tenant (uq_tenant_whatsapp), so a number already
-          // used by an employee in a DIFFERENT tenant would otherwise
-          // create the exact ambiguous-employee collision
-          // tenantResolution.js already has to silently drop messages
-          // for (services/tenantResolution.js, 'ambiguous_employee').
-          // Checked here, before creation, rather than discovered after
-          // the fact.
-          const existing = await getEmployeeByPhoneAnyTenant(rawNumber);
-          if (existing.length > 0) {
-            await whatsapp.sendText(tenant, from, 'This number is already registered to an employee. Please provide a different WhatsApp number.');
-            return;
-          }
-          await setConvState(tenant.id, from, { step: 'awaiting_staff_role', data: { ...convState.data, whatsappNumber: rawNumber } });
-          await whatsapp.sendText(tenant, from, "🏷️ What's their role? (e.g. Waiter, Chef, Manager)");
-          return;
         }
 
         if (convState && convState.step === 'awaiting_staff_role') {
@@ -591,19 +614,27 @@ router.post('/', async (req, res) => {
         if (convState && convState.step === 'awaiting_stock_quantity') {
           const rawQuantity = message.text.body.trim();
           const quantity = Number(rawQuantity);
-          if (rawQuantity === '' || Number.isNaN(quantity) || quantity < 0) {
+          const isInvalidQuantity = rawQuantity === '' || Number.isNaN(quantity) || quantity < 0;
+          if (isInvalidQuantity && /[a-zA-Z]/.test(rawQuantity)) {
+            // Not a plausible quantity attempt at all — same escape hatch as
+            // awaiting_order_item_quantity/awaiting_qr_amount: clear the
+            // stale state and fall through instead of trapping them behind
+            // "invalid quantity" no matter what they type.
+            await deleteConvState(tenant.id, from);
+          } else if (isInvalidQuantity) {
             await whatsapp.sendText(tenant, from, "That doesn't look like a valid quantity. Please reply with a non-negative number (e.g. 10 or 12.5).");
             return;
-          }
-          await deleteConvState(tenant.id, from);
-          const { itemId, itemName } = convState.data;
-          const success = await updateInventoryStock(tenant.id, itemId, quantity);
-          if (!success) {
-            await whatsapp.sendText(tenant, from, '❌ Failed to update stock. Please try again or contact support.');
+          } else {
+            await deleteConvState(tenant.id, from);
+            const { itemId, itemName } = convState.data;
+            const success = await updateInventoryStock(tenant.id, itemId, quantity);
+            if (!success) {
+              await whatsapp.sendText(tenant, from, '❌ Failed to update stock. Please try again or contact support.');
+              return;
+            }
+            await whatsapp.sendText(tenant, from, `✅ *Stock Updated*\n\n📦 ${itemName || 'Item'}: ${quantity}`);
             return;
           }
-          await whatsapp.sendText(tenant, from, `✅ *Stock Updated*\n\n📦 ${itemName || 'Item'}: ${quantity}`);
-          return;
         }
 
         // ── Add-item state machine ─────────────────────────────────────
@@ -637,25 +668,37 @@ router.post('/', async (req, res) => {
         if (convState && convState.step === 'awaiting_item_stock') {
           const rawStock = message.text.body.trim();
           const currentStock = Number(rawStock);
-          if (rawStock === '' || Number.isNaN(currentStock) || currentStock < 0) {
+          const isInvalidStock = rawStock === '' || Number.isNaN(currentStock) || currentStock < 0;
+          if (isInvalidStock && /[a-zA-Z]/.test(rawStock)) {
+            // Not a plausible quantity attempt at all — same escape hatch as
+            // awaiting_order_item_quantity/awaiting_qr_amount: clear the
+            // stale state and fall through instead of trapping them behind
+            // "invalid quantity" no matter what they type.
+            await deleteConvState(tenant.id, from);
+          } else if (isInvalidStock) {
             await whatsapp.sendText(tenant, from, "That doesn't look like a valid quantity. Please reply with a non-negative number (e.g. 10 or 12.5).");
             return;
+          } else {
+            await setConvState(tenant.id, from, { step: 'awaiting_item_minimum', data: { ...convState.data, currentStock } });
+            await whatsapp.sendText(tenant, from, "⚠️ What's the minimum stock level? (for low-stock alerts)");
+            return;
           }
-          await setConvState(tenant.id, from, { step: 'awaiting_item_minimum', data: { ...convState.data, currentStock } });
-          await whatsapp.sendText(tenant, from, "⚠️ What's the minimum stock level? (for low-stock alerts)");
-          return;
         }
 
         if (convState && convState.step === 'awaiting_item_minimum') {
           const rawMinimum = message.text.body.trim();
           const minimumStock = Number(rawMinimum);
-          if (rawMinimum === '' || Number.isNaN(minimumStock) || minimumStock < 0) {
+          const isInvalidMinimum = rawMinimum === '' || Number.isNaN(minimumStock) || minimumStock < 0;
+          if (isInvalidMinimum && /[a-zA-Z]/.test(rawMinimum)) {
+            await deleteConvState(tenant.id, from);
+          } else if (isInvalidMinimum) {
             await whatsapp.sendText(tenant, from, "That doesn't look like a valid quantity. Please reply with a non-negative number (e.g. 5 or 2.5).");
             return;
+          } else {
+            await setConvState(tenant.id, from, { step: 'awaiting_item_unit', data: { ...convState.data, minimumStock } });
+            await whatsapp.sendText(tenant, from, "📏 What's the unit? (e.g. kg, pack, bottle)");
+            return;
           }
-          await setConvState(tenant.id, from, { step: 'awaiting_item_unit', data: { ...convState.data, minimumStock } });
-          await whatsapp.sendText(tenant, from, "📏 What's the unit? (e.g. kg, pack, bottle)");
-          return;
         }
 
         if (convState && convState.step === 'awaiting_item_unit') {
@@ -710,23 +753,31 @@ router.post('/', async (req, res) => {
         if (convState && convState.step === 'awaiting_menu_item_price') {
           const rawPrice = message.text.body.trim();
           const price = Number(rawPrice);
-          if (rawPrice === '' || Number.isNaN(price) || price <= 0) {
+          const isInvalidPrice = rawPrice === '' || Number.isNaN(price) || price <= 0;
+          if (isInvalidPrice && /[a-zA-Z]/.test(rawPrice)) {
+            // Not a plausible price attempt at all — same escape hatch as
+            // awaiting_order_item_quantity/awaiting_qr_amount: clear the
+            // stale state and fall through instead of trapping them behind
+            // "invalid price" no matter what they type.
+            await deleteConvState(tenant.id, from);
+          } else if (isInvalidPrice) {
             await whatsapp.sendText(tenant, from, "That doesn't look like a valid price. Please reply with a positive number (e.g. 8.50).");
             return;
-          }
-          await deleteConvState(tenant.id, from);
-          const { name, category } = convState.data;
-          const result = await createMenuItem(tenant.id, name, category, price);
-          if (!result) {
-            await whatsapp.sendText(tenant, from, '❌ Failed to add the new menu item. Please try again or contact support.');
+          } else {
+            await deleteConvState(tenant.id, from);
+            const { name, category } = convState.data;
+            const result = await createMenuItem(tenant.id, name, category, price);
+            if (!result) {
+              await whatsapp.sendText(tenant, from, '❌ Failed to add the new menu item. Please try again or contact support.');
+              return;
+            }
+            await whatsapp.sendText(
+              tenant,
+              from,
+              `✅ *Menu Item Added*\n\n🍽️ ${name}\n🏷️ Category: ${category}\n💰 Price: RM${price.toFixed(2)}`
+            );
             return;
           }
-          await whatsapp.sendText(
-            tenant,
-            from,
-            `✅ *Menu Item Added*\n\n🍽️ ${name}\n🏷️ Category: ${category}\n💰 Price: RM${price.toFixed(2)}`
-          );
-          return;
         }
 
         // ── New-order state machine (dine-in table-number step) ──────────
@@ -819,22 +870,31 @@ router.post('/', async (req, res) => {
           // silently accepting garbage.
           const expiryDate = parseDateFlexible(message.text.body);
           if (!expiryDate) {
-            await whatsapp.sendText(tenant, from, "That doesn't look like a valid date. Please reply with the expiry date in YYYY-MM-DD or DD/MM/YYYY format.");
+            if (/[a-zA-Z]/.test(message.text.body.trim())) {
+              // Not a plausible date attempt at all — same escape hatch as
+              // awaiting_order_item_quantity/awaiting_qr_amount: clear the
+              // stale state and fall through instead of trapping them
+              // behind "invalid date" no matter what they type.
+              await deleteConvState(tenant.id, from);
+            } else {
+              await whatsapp.sendText(tenant, from, "That doesn't look like a valid date. Please reply with the expiry date in YYYY-MM-DD or DD/MM/YYYY format.");
+              return;
+            }
+          } else {
+            await deleteConvState(tenant.id, from);
+            const { employeeId, employeeName, documentType, documentNumber } = convState.data;
+            const result = await createForeignWorkerDocument(tenant.id, employeeId, employeeName, documentType, documentNumber, null, expiryDate);
+            if (!result) {
+              await whatsapp.sendText(tenant, from, '❌ Failed to add the document. Please try again or contact support.');
+              return;
+            }
+            await whatsapp.sendText(
+              tenant,
+              from,
+              `✅ *Document Added*\n\n👤 Employee: ${employeeName}\n🏷️ Type: ${documentType}\n🔢 Number: ${documentNumber}\n📅 Expires: ${expiryDate}`
+            );
             return;
           }
-          await deleteConvState(tenant.id, from);
-          const { employeeId, employeeName, documentType, documentNumber } = convState.data;
-          const result = await createForeignWorkerDocument(tenant.id, employeeId, employeeName, documentType, documentNumber, null, expiryDate);
-          if (!result) {
-            await whatsapp.sendText(tenant, from, '❌ Failed to add the document. Please try again or contact support.');
-            return;
-          }
-          await whatsapp.sendText(
-            tenant,
-            from,
-            `✅ *Document Added*\n\n👤 Employee: ${employeeName}\n🏷️ Type: ${documentType}\n🔢 Number: ${documentNumber}\n📅 Expires: ${expiryDate}`
-          );
-          return;
         }
 
         // QR Code's only text step — set directly by the 'qr_code'
